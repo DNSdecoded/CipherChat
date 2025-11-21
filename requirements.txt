@@ -1,0 +1,15 @@
+# Encrypted Dual-Stack Chat Dependencies
+
+# Core cryptography library for E2E encryption
+cryptography>=41.0.0  # RSA, AES-GCM, digital signatures
+
+# Standard library (no installation needed):
+# - socket (networking)
+# - ssl (TLS/SSL encryption)
+# - threading (concurrent client handling)
+# - json (message protocol)
+# - logging (server logging)
+# - datetime (timestamps)
+
+# External tools required:
+# - OpenSSL (for TLS certificate generation)
