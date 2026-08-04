@@ -7,9 +7,10 @@ Provides X25519 ECDH key generation and Diffie-Hellman operations for Forward Se
 import os
 import hashlib
 import hmac
-from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.exceptions import InvalidSignature
 from typing import Tuple
 
 
@@ -83,6 +84,104 @@ class X25519KeyPair:
         """
         private_key = x25519.X25519PrivateKey.from_private_bytes(private_bytes)
         return X25519KeyPair(private_key)
+
+
+class Ed25519KeyPair:
+    """
+    Ed25519 key pair for digital signatures.
+
+    X25519 keys perform Diffie-Hellman but cannot sign. This is the long-term
+    identity key: it signs the X25519 identity key and the signed pre-key, which
+    is what lets a peer detect a substituted pre-key bundle. TOFU pins this key.
+    """
+
+    def __init__(self, private_key=None):
+        """
+        Initialize Ed25519 key pair.
+
+        Args:
+            private_key: Optional existing private key (for deserialization)
+        """
+        if private_key is None:
+            self.private_key = ed25519.Ed25519PrivateKey.generate()
+        else:
+            self.private_key = private_key
+
+        self.public_key = self.private_key.public_key()
+
+    def get_public_bytes(self) -> bytes:
+        """
+        Get public key as raw bytes (32 bytes).
+
+        Returns:
+            32-byte public key
+        """
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+    def get_private_bytes(self) -> bytes:
+        """
+        Get private key as raw bytes (32 bytes).
+
+        Returns:
+            32-byte private key
+        """
+        return self.private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+
+    def sign(self, data: bytes) -> bytes:
+        """
+        Sign data with the private key.
+
+        Args:
+            data: Message to sign
+
+        Returns:
+            64-byte Ed25519 signature
+        """
+        return self.private_key.sign(data)
+
+    @staticmethod
+    def verify(public_key_bytes: bytes, signature: bytes, data: bytes) -> bool:
+        """
+        Verify a signature against a public key.
+
+        Static because the verifier only ever holds the peer's public key.
+
+        Args:
+            public_key_bytes: Signer's 32-byte Ed25519 public key
+            signature: 64-byte signature to check
+            data: Message that was signed
+
+        Returns:
+            True if the signature is valid, False otherwise
+        """
+        try:
+            public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+            public_key.verify(signature, data)
+            return True
+        except (InvalidSignature, ValueError):
+            # ValueError covers a malformed key or signature length
+            return False
+
+    @staticmethod
+    def from_private_bytes(private_bytes: bytes) -> 'Ed25519KeyPair':
+        """
+        Create key pair from private key bytes.
+
+        Args:
+            private_bytes: 32-byte private key
+
+        Returns:
+            Ed25519KeyPair instance
+        """
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(private_bytes)
+        return Ed25519KeyPair(private_key)
 
 
 def kdf_rk(root_key: bytes, dh_output: bytes) -> Tuple[bytes, bytes]:
@@ -246,5 +345,38 @@ if __name__ == "__main__":
         "Bob"
     )
     print(f"\n[OK] Safety number:\n  {safety}")
-    
+
+    # Test Ed25519 signatures
+    signer = Ed25519KeyPair()
+    signer_pub = signer.get_public_bytes()
+    assert len(signer_pub) == 32
+
+    payload = alice.get_public_bytes() + bob.get_public_bytes()
+    signature = signer.sign(payload)
+    assert len(signature) == 64
+    assert Ed25519KeyPair.verify(signer_pub, signature, payload)
+    print(f"\n[OK] Ed25519 signature verifies")
+
+    # A tampered payload must NOT verify
+    tampered = bytearray(payload)
+    tampered[0] ^= 0x01
+    assert not Ed25519KeyPair.verify(signer_pub, signature, bytes(tampered))
+    print("[OK] Tampered payload rejected")
+
+    # A signature from a different key must NOT verify
+    attacker = Ed25519KeyPair()
+    assert not Ed25519KeyPair.verify(signer_pub, attacker.sign(payload), payload)
+    print("[OK] Wrong-signer signature rejected")
+
+    # Garbage signature must return False, not raise
+    assert not Ed25519KeyPair.verify(signer_pub, b"\x00" * 64, payload)
+    assert not Ed25519KeyPair.verify(signer_pub, b"short", payload)
+    print("[OK] Malformed signature rejected without raising")
+
+    # Round-trip through raw private bytes
+    restored = Ed25519KeyPair.from_private_bytes(signer.get_private_bytes())
+    assert restored.get_public_bytes() == signer_pub
+    assert Ed25519KeyPair.verify(signer_pub, restored.sign(payload), payload)
+    print("[OK] Ed25519 private key round-trip works")
+
     print("\n[PASS] All X25519 tests passed!")

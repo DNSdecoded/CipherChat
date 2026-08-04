@@ -14,7 +14,25 @@ from dataclasses import dataclass
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from x25519_utils import X25519KeyPair
+from x25519_utils import X25519KeyPair, Ed25519KeyPair
+
+
+def prekey_signing_payload(identity_key: bytes, signed_prekey: bytes) -> bytes:
+    """
+    Build the byte string covered by the pre-key signature.
+
+    Both inputs are fixed 32-byte X25519 public keys, so plain concatenation is
+    unambiguous. Binding the identity key into the signature is what stops an
+    attacker from pairing a victim's signed pre-key with their own identity key.
+
+    Args:
+        identity_key: 32-byte X25519 identity public key
+        signed_prekey: 32-byte X25519 signed pre-key public key
+
+    Returns:
+        Payload to sign / verify
+    """
+    return b"CipherChat-SPK-v3" + identity_key + signed_prekey
 
 
 @dataclass
@@ -25,28 +43,39 @@ class X3DHPreKeyBundle:
     """
     # Identity key (long-term, never changes)
     identity_key: bytes  # 32-byte X25519 public key
-    
+
+    # Signing key (long-term Ed25519 public key; this is what TOFU pins)
+    signing_key: bytes  # 32-byte Ed25519 public key
+
     # Signed pre-key (medium-term, rotated periodically)
     signed_prekey: bytes  # 32-byte X25519 public key
-    signed_prekey_signature: bytes  # Signature of signed_prekey
-    
+    signed_prekey_signature: bytes  # Ed25519 sig over identity_key||signed_prekey
+
     # One-time pre-keys (ephemeral, used once and deleted)
     onetime_prekey: Optional[bytes] = None  # 32-byte X25519 public key
-    
+
     def to_dict(self) -> dict:
         """Serialize bundle for transmission"""
         return {
             'identity_key': self.identity_key.hex(),
+            'signing_key': self.signing_key.hex(),
             'signed_prekey': self.signed_prekey.hex(),
             'signed_prekey_signature': self.signed_prekey_signature.hex(),
             'onetime_prekey': self.onetime_prekey.hex() if self.onetime_prekey else None
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict) -> 'X3DHPreKeyBundle':
-        """Deserialize bundle"""
+        """
+        Deserialize bundle.
+
+        Raises:
+            KeyError, ValueError: on a malformed or truncated bundle. Callers
+                take bundles straight off the wire, so they must catch these.
+        """
         return cls(
             identity_key=bytes.fromhex(data['identity_key']),
+            signing_key=bytes.fromhex(data['signing_key']),
             signed_prekey=bytes.fromhex(data['signed_prekey']),
             signed_prekey_signature=bytes.fromhex(data['signed_prekey_signature']),
             onetime_prekey=bytes.fromhex(data['onetime_prekey']) if data.get('onetime_prekey') else None
@@ -61,9 +90,13 @@ class X3DHKeyManager:
     
     def __init__(self):
         """Initialize key manager"""
-        # Long-term identity key
+        # Long-term identity key (X25519, used for Diffie-Hellman)
         self.identity_keypair = X25519KeyPair()
-        
+
+        # Long-term signing key (Ed25519). X25519 keys cannot sign, so identity
+        # authentication rides on this key; TOFU pins it.
+        self.signing_keypair = Ed25519KeyPair()
+
         # Medium-term signed pre-key (rotated periodically)
         self.signed_prekey_pair = X25519KeyPair()
         
@@ -95,57 +128,41 @@ class X3DHKeyManager:
         # OPKs without identity verification create a false sense of security
         # and are vulnerable to server-side key substitution attacks.
         onetime_key = None
-        
-        # Sign the signed pre-key with identity key
-        # For simplicity, we'll use a hash-based signature
-        # In production, use Ed25519 signatures
-        signature = self._sign_prekey(
-            self.signed_prekey_pair.get_public_bytes(),
-            self.identity_keypair.get_private_bytes()
-        )
-        
+
+        identity_public = self.identity_keypair.get_public_bytes()
+        signed_prekey_public = self.signed_prekey_pair.get_public_bytes()
+
         return X3DHPreKeyBundle(
-            identity_key=self.identity_keypair.get_public_bytes(),
-            signed_prekey=self.signed_prekey_pair.get_public_bytes(),
-            signed_prekey_signature=signature,
+            identity_key=identity_public,
+            signing_key=self.signing_keypair.get_public_bytes(),
+            signed_prekey=signed_prekey_public,
+            signed_prekey_signature=self.signing_keypair.sign(
+                prekey_signing_payload(identity_public, signed_prekey_public)
+            ),
             onetime_prekey=onetime_key  # Always None until MITM protection
         )
-    
-    def _sign_prekey(self, prekey: bytes, identity_private: bytes) -> bytes:
-        """
-        Sign a pre-key with identity key.
-        
-        Note: This is a simplified signature. In production, use Ed25519.
-        
-        Args:
-            prekey: Pre-key to sign
-            identity_private: Identity private key
-        
-        Returns:
-            Signature bytes
-        """
-        # Simple HMAC-based signature
-        import hmac
-        return hmac.new(identity_private, prekey, hashlib.sha256).digest()
-    
-    def verify_prekey_signature(self, prekey: bytes, signature: bytes, identity_public: bytes) -> bool:
-        """
-        Verify a pre-key signature.
-        
-        Note: This matches the simplified signature above.
-        
-        Args:
-            prekey: Pre-key that was signed
-            signature: Signature to verify
-            identity_public: Identity public key
-        
-        Returns:
-            True if signature is valid
-        """
-        # For our simplified signature, we can't verify without the private key
-        # In production with Ed25519, this would properly verify
-        # For now, we'll accept all signatures (not secure, but works for demo)
-        return True
+
+
+def verify_prekey_bundle(bundle: X3DHPreKeyBundle) -> bool:
+    """
+    Verify that a bundle's signed pre-key really was signed by its signing key.
+
+    This is the check that makes the bundle self-consistent. It does NOT tell you
+    the signing key belongs to the person you think it does — that is the job of
+    the TOFU pin in the client. Both are required: the pin establishes which
+    signing key is authentic, this proves the DH keys are bound to that key.
+
+    Args:
+        bundle: Bundle received from the server
+
+    Returns:
+        True if the signature is valid over identity_key||signed_prekey
+    """
+    return Ed25519KeyPair.verify(
+        bundle.signing_key,
+        bundle.signed_prekey_signature,
+        prekey_signing_payload(bundle.identity_key, bundle.signed_prekey)
+    )
 
 
 def x3dh_initiate(
@@ -263,8 +280,43 @@ if __name__ == "__main__":
     bob_bundle = bob_key_manager.get_prekey_bundle()
     
     print(f"[OK] Bob's identity key: {bob_bundle.identity_key.hex()[:32]}...")
+    print(f"[OK] Bob's signing key: {bob_bundle.signing_key.hex()[:32]}...")
     print(f"[OK] Bob's signed prekey: {bob_bundle.signed_prekey.hex()[:32]}...")
     print(f"[OK] Bob's onetime prekey: {bob_bundle.onetime_prekey.hex()[:32] if bob_bundle.onetime_prekey else 'None'}...")
+
+    # The bundle must verify against its own signing key
+    assert verify_prekey_bundle(bob_bundle), "Bob's own bundle failed verification!"
+    print("[OK] Bundle signature verifies")
+
+    # A substituted signed pre-key must be detected
+    forged = X3DHPreKeyBundle(
+        identity_key=bob_bundle.identity_key,
+        signing_key=bob_bundle.signing_key,
+        signed_prekey=X25519KeyPair().get_public_bytes(),  # attacker's key
+        signed_prekey_signature=bob_bundle.signed_prekey_signature,
+        onetime_prekey=None
+    )
+    assert not verify_prekey_bundle(forged), "Substituted pre-key was accepted!"
+    print("[OK] Substituted signed pre-key rejected")
+
+    # Swapping in the attacker's own identity key must also be detected,
+    # since the identity key is covered by the signature
+    mixed = X3DHPreKeyBundle(
+        identity_key=X25519KeyPair().get_public_bytes(),
+        signing_key=bob_bundle.signing_key,
+        signed_prekey=bob_bundle.signed_prekey,
+        signed_prekey_signature=bob_bundle.signed_prekey_signature,
+        onetime_prekey=None
+    )
+    assert not verify_prekey_bundle(mixed), "Substituted identity key was accepted!"
+    print("[OK] Substituted identity key rejected")
+
+    # A wholly attacker-generated bundle verifies against ITS OWN key — that is
+    # expected, and is exactly why TOFU must pin the signing key separately.
+    attacker_bundle = X3DHKeyManager().get_prekey_bundle()
+    assert verify_prekey_bundle(attacker_bundle)
+    assert attacker_bundle.signing_key != bob_bundle.signing_key
+    print("[OK] Attacker bundle is self-consistent but has a different signing key")
     
     # Alice initiates X3DH
     print("\n[2] Alice initiates X3DH...")
@@ -297,6 +349,10 @@ if __name__ == "__main__":
     bundle_dict = bob_bundle.to_dict()
     restored_bundle = X3DHPreKeyBundle.from_dict(bundle_dict)
     assert restored_bundle.identity_key == bob_bundle.identity_key
+    assert restored_bundle.signing_key == bob_bundle.signing_key
+    assert restored_bundle.signed_prekey_signature == bob_bundle.signed_prekey_signature
+    # Verification must survive a round trip through the wire format
+    assert verify_prekey_bundle(restored_bundle)
     print("[OK] Bundle serialization works!")
     
     print("\n[PASS] All X3DH tests passed!")

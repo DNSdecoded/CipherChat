@@ -30,21 +30,30 @@ logger = logging.getLogger('ChatServer')
 class ChatServer:
     """Encrypted chat server supporting multiple clients over IPv4 and IPv6."""
     
-    PROTOCOL_VERSION = "2.0"  # Forward Secrecy protocol
-    
+    PROTOCOL_VERSION = "3.0"  # Ed25519-signed bundles + AEAD-bound headers
+
+    # Cap on unparsed input held per connection. MAX_MESSAGE_LENGTH is not the
+    # right bound here because key bundles are far larger than a chat line.
+    # Without this a client that never sends a newline grows the buffer forever.
+    MAX_BUFFER_SIZE = 64 * 1024
+
     def __init__(self, port=config.SERVER_PORT, enable_ipv4=config.ENABLE_IPV4, enable_ipv6=config.ENABLE_IPV6):
         self.port = port
         self.enable_ipv4 = enable_ipv4
         self.enable_ipv6 = enable_ipv6
         self.clients = {}  # {connection: username}
-        self.clients_lock = threading.Lock()
         self.running = False
         self.server_socket_ipv4 = None
         self.server_socket_ipv6 = None
-        
+
         # Forward Secrecy: X3DH bundle registry
         self.client_bundles = {}  # {username: bundle_dict}
-        self.bundles_lock = threading.Lock()
+
+        # One lock guards both `clients` and `client_bundles`. They are updated
+        # together on join and leave, and broadcast() needs the client list, so
+        # two locks would have to nest — and broadcast-under-lock would deadlock.
+        # Never hold this across a socket send; snapshot, release, then send.
+        self.state_lock = threading.Lock()
         
     def create_ssl_context(self):
         """Create and configure SSL context for secure connections."""
@@ -193,7 +202,15 @@ class ChatServer:
                 
                 # Add received data to buffer
                 buffer += data.decode('utf-8')
-                
+
+                # Refuse to accumulate unbounded input from a client that never
+                # sends a delimiter — otherwise this grows until the host OOMs.
+                if len(buffer) > self.MAX_BUFFER_SIZE:
+                    logger.warning(
+                        f"Buffer limit exceeded by {username or address}; dropping connection"
+                    )
+                    break
+
                 # Process all complete messages in buffer (newline-delimited)
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
@@ -222,27 +239,43 @@ class ChatServer:
                                     client_socket.close()
                                     return
                                 
-                                # Register client
-                                with self.clients_lock:
-                                    self.clients[client_socket] = username
-                                
-                                # Store X3DH bundle if provided
+                                # Register client and publish the bundle in one
+                                # critical section, so a concurrent join cannot
+                                # observe a half-registered user. No sends here.
+                                existing_bundles = {}
+                                with self.state_lock:
+                                    if username in self.clients.values():
+                                        duplicate = True
+                                    else:
+                                        duplicate = False
+                                        self.clients[client_socket] = username
+                                        if bundle_dict and config.E2E_ENABLED:
+                                            self.client_bundles[username] = bundle_dict
+                                        if config.E2E_ENABLED:
+                                            existing_bundles = {
+                                                uname: bundle
+                                                for uname, bundle in self.client_bundles.items()
+                                                if uname != username
+                                            }
+
+                                # A duplicate name would overwrite the original's
+                                # bundle and silently capture traffic meant for them.
+                                if duplicate:
+                                    self.send_message(client_socket, {
+                                        'type': 'error',
+                                        'content': f"Username '{username}' is already taken.",
+                                        'timestamp': datetime.now().isoformat()
+                                    })
+                                    logger.warning(f"Rejected duplicate username '{username}' from {address}")
+                                    return
+
                                 if bundle_dict and config.E2E_ENABLED:
-                                    with self.bundles_lock:
-                                        self.client_bundles[username] = bundle_dict
                                     logger.info(f"[E2E] Stored X3DH bundle for {username}")
-                                
+
                                 logger.info(f"User '{username}' joined from {address} (v{protocol_version})")
-                                
+
                                 # Send all existing bundles to the new user (bundle_sync)
                                 if config.E2E_ENABLED:
-                                    with self.bundles_lock:
-                                        existing_bundles = {
-                                            uname: bundle 
-                                            for uname, bundle in self.client_bundles.items() 
-                                            if uname != username
-                                        }
-                                    
                                     bundle_sync_msg = {
                                         'type': 'bundle_sync',
                                         'bundles': existing_bundles,
@@ -282,10 +315,16 @@ class ChatServer:
                         elif msg_type == 'ratchet_message':
                             if username:  # Only process if user has joined
                                 recipient = message.get('recipient')
-                                
+
+                                # Never trust the client's own claim of who it is.
+                                # The header inside the ciphertext is AEAD-bound
+                                # and is what the recipient actually verifies;
+                                # this keeps the envelope consistent with it.
+                                message['sender'] = username
+
                                 # Find recipient socket
                                 recipient_socket = None
-                                with self.clients_lock:
+                                with self.state_lock:
                                     for sock, user in self.clients.items():
                                         if user == recipient:
                                             recipient_socket = sock
@@ -313,7 +352,11 @@ class ChatServer:
                                 message['username'] = username
                                 message['timestamp'] = datetime.now().isoformat()
                                 content = message.get('content', '')[:config.MAX_MESSAGE_LENGTH]
-                                logger.info(f"[{username}]: {content}")
+                                message['content'] = content
+                                # Never log message bodies. This path is plaintext
+                                # by definition, so the content would otherwise be
+                                # written to server.log permanently.
+                                logger.info(f"[{username}] plaintext message ({len(content)} chars)")
                                 self.broadcast(message)
                         
                     except json.JSONDecodeError:
@@ -327,23 +370,25 @@ class ChatServer:
             logger.error(f"Error handling client {username or address}: {e}")
         
         finally:
-            # Cleanup
-            with self.clients_lock:
+            # Cleanup. Key off what was actually registered, NOT the local
+            # `username` — a rejected join (duplicate name, bad version) sets
+            # that variable without ever registering, and tearing down on it
+            # would evict the legitimate holder of the name.
+            departed = None
+            bundle_removed = False
+            with self.state_lock:
                 if client_socket in self.clients:
-                    username = self.clients.pop(client_socket)
-            
-            if username:
+                    departed = self.clients.pop(client_socket)
+                    if config.E2E_ENABLED and departed in self.client_bundles:
+                        del self.client_bundles[departed]
+                        bundle_removed = True
+
+            if departed:
+                username = departed
                 logger.info(f"User '{username}' disconnected")
-                
-                # Remove user's X3DH bundle from server registry
-                bundle_removed = False
-                if config.E2E_ENABLED:
-                    with self.bundles_lock:
-                        if username in self.client_bundles:
-                            del self.client_bundles[username]
-                            bundle_removed = True
-                            logger.info(f"[E2E] Removed X3DH bundle for {username}")
-                
+                if bundle_removed:
+                    logger.info(f"[E2E] Removed X3DH bundle for {username}")
+
                 # Notify other clients that user left
                 leave_msg = {
                     'type': 'system',
@@ -377,137 +422,29 @@ class ChatServer:
     
     def broadcast(self, message, exclude=None):
         """Broadcast message to all connected clients."""
-        with self.clients_lock:
-            dead_sockets = []
-            
-            for client_socket in self.clients.keys():
-                if client_socket == exclude:
-                    continue
-                
-                try:
-                    self.send_message(client_socket, message)
-                except Exception as e:
-                    logger.error(f"Error broadcasting to client: {e}")
-                    dead_sockets.append(client_socket)
-            
-            # Clean up dead connections
-            for socket in dead_sockets:
-                if socket in self.clients:
-                    username = self.clients.pop(socket)
-                    logger.warning(f"Removed dead connection: {username}")
-                    
-                    # Also remove their public key
-                    if config.E2E_ENABLED:
-                        with self.public_keys_lock:
-                            if username in self.client_public_keys:
-                                del self.client_public_keys[username]
-                                logger.info(f"[E2E] Removed public key for disconnected user: {username}")
-    
-    def handle_key_exchange(self, username: str, message: dict):
-        """Handle public key exchange from client."""
-        public_key = message.get('public_key')
-        if public_key:
-            with self.public_keys_lock:
-                self.client_public_keys[username] = public_key
-            logger.info(f"[E2E] Stored public key for {username}")
-            
-            # Notify user
-            confirm_msg = {
-                'type': 'key_exchange_confirm',
-                'content': 'Public key registered successfully',
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Find client socket by username
-            client_socket = None
-            with self.clients_lock:
-                for sock, uname in self.clients.items():
-                    if uname == username:
-                        client_socket = sock
-                        break
-            
-            if client_socket:
-                self.send_message(client_socket, confirm_msg)
-                
-                # Automatically send all OTHER users' public keys to this new user
-                with self.public_keys_lock:
-                    other_keys = {
-                        uname: key 
-                        for uname, key in self.client_public_keys.items() 
-                        if uname != username  # Exclude their own key
-                    }
-                
-                if other_keys:
-                    keys_response = {
-                        'type': 'key_response',
-                        'keys': other_keys,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    self.send_message(client_socket, keys_response)
-                    logger.info(f"[E2E] Auto-sent {len(other_keys)} public key(s) to {username}")
-    
-    def handle_key_request(self, client_socket, message: dict):
-        """Handle request for other clients' public keys."""
-        # Support both single user request and multiple users request
-        requested_username = message.get('username')  # Single user
-        requested_usernames = message.get('usernames', [])  # Multiple users
-        
-        # Normalize to list
-        if requested_username:
-            requested_usernames = [requested_username]
-        
-        if not requested_usernames:
-            logger.warning("[E2E] Key request received with no usernames")
-            return
-        
-        keys = {}
-        missing = []
-        
-        with self.public_keys_lock:
-            for username in requested_usernames:
-                if username in self.client_public_keys:
-                    keys[username] = self.client_public_keys[username]
-                else:
-                    missing.append(username)
-        
-        # Send available keys
-        if keys:
-            response = {
-                'type': 'key_response',
-                'keys': keys,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.send_message(client_socket, response)
-            logger.info(f"[E2E] Sent {len(keys)} public key(s) to client")
-        
-        # Send error for missing keys
-        if missing:
-            error_response = {
-                'type': 'key_error',
-                'missing_users': missing,
-                'message': f'Public keys not available for: {", ".join(missing)}',
-                'timestamp': datetime.now().isoformat()
-            }
-            self.send_message(client_socket, error_response)
-            logger.warning(f"[E2E] Requested keys not available for: {missing}")
+        # Snapshot under the lock, then send outside it. sendall() can block on a
+        # slow client, and holding the lock across that would stall every join,
+        # leave, and relay in the server.
+        with self.state_lock:
+            targets = [sock for sock in self.clients if sock != exclude]
+
+        for client_socket in targets:
+            self.send_message(client_socket, message)
+        # Dead connections are reaped by handle_client's finally block, which also
+        # drops the user's X3DH bundle and notifies the remaining peers.
     
     def get_all_usernames(self) -> list:
         """Get list of all connected usernames."""
-        with self.clients_lock:
+        with self.state_lock:
             return list(self.clients.values())
-    
-    def get_all_public_keys(self) -> dict:
-        """Get all client public keys."""
-        with self.public_keys_lock:
-            return self.client_public_keys.copy()
-    
+
     def stop(self):
         """Stop the server and cleanup resources."""
         logger.info("Stopping server...")
         self.running = False
         
         # Close all client connections
-        with self.clients_lock:
+        with self.state_lock:
             for client_socket in list(self.clients.keys()):
                 try:
                     client_socket.close()

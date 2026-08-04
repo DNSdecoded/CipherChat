@@ -8,6 +8,7 @@ https://signal.org/docs/specifications/doubleratchet/
 """
 
 import os
+import copy
 import json
 import base64
 from dataclasses import dataclass, field, asdict
@@ -16,6 +17,26 @@ from datetime import datetime
 
 from x25519_utils import X25519KeyPair, kdf_rk, kdf_ck
 from crypto_utils import MessageEncryptor
+
+
+def _header_ad(header: dict) -> bytes:
+    """
+    Canonicalize a message header into AES-GCM associated data.
+
+    The header travels in cleartext, so without this it is unauthenticated and an
+    attacker can rewrite `dh_public` to force the receiver onto a chain they
+    control. Binding it as AD makes any edit fail the GCM tag.
+
+    Sender and receiver must produce byte-identical output, hence sorted keys and
+    no whitespace. Any field added to the header is covered automatically.
+
+    Args:
+        header: Message header dict (JSON-serializable values only)
+
+    Returns:
+        Canonical UTF-8 encoding of the header
+    """
+    return json.dumps(header, sort_keys=True, separators=(',', ':')).encode('utf-8')
 
 
 @dataclass
@@ -166,142 +187,190 @@ class DoubleRatchet:
         self.state = state
         self.encryptor = MessageEncryptor()
     
-    def ratchet_encrypt(self, plaintext: bytes, associated_data: bytes = b"") -> Tuple[bytes, dict]:
+    # Header fields the ratchet owns; callers may not override these
+    _RESERVED_HEADER_FIELDS = frozenset(
+        {'dh_public', 'message_number', 'previous_chain_length'}
+    )
+
+    def ratchet_encrypt(self, plaintext: bytes,
+                        extra_header: Optional[dict] = None) -> Tuple[bytes, dict]:
         """
         Encrypt message and advance sending ratchet.
-        
+
+        The returned header is bound into the ciphertext as associated data, so
+        it must be transmitted verbatim — a single altered field makes the
+        recipient's decrypt fail. Callers pass any extra fields in up front
+        rather than mutating the header afterwards.
+
         Args:
             plaintext: Message to encrypt
-            associated_data: Additional authenticated data (not encrypted)
-        
+            extra_header: Extra header fields to bind (e.g. sender,
+                x3dh_ephemeral). JSON-serializable values only.
+
         Returns:
             Tuple of (ciphertext, header_dict)
-            header_dict contains: dh_public, message_number, previous_chain_length
+
+        Raises:
+            ValueError: If extra_header collides with a ratchet-owned field
         """
-        # Derive message key from sending chain
-        self.state.chain_key_send, message_key = kdf_ck(self.state.chain_key_send)
-        
         # Create header
         header = {
             'dh_public': self.state.dh_self_public.hex(),
             'message_number': self.state.message_number_send,
             'previous_chain_length': self.state.previous_chain_length
         }
-        
-        # Encrypt with AES-256-GCM using message key
-        ciphertext = self.encryptor.aes_gcm_encrypt(plaintext, message_key, associated_data)
-        
+
+        if extra_header:
+            clash = self._RESERVED_HEADER_FIELDS & set(extra_header)
+            if clash:
+                raise ValueError(f"extra_header may not override {sorted(clash)}")
+            header.update(extra_header)
+
+        # Derive message key from sending chain
+        self.state.chain_key_send, message_key = kdf_ck(self.state.chain_key_send)
+
+        # Encrypt with AES-256-GCM, binding the header as associated data
+        ciphertext = self.encryptor.aes_gcm_encrypt(
+            plaintext, message_key, _header_ad(header)
+        )
+
         # Increment message number
         self.state.message_number_send += 1
-        
+
         return ciphertext, header
-    
-    def ratchet_decrypt(self, ciphertext: bytes, header: dict, 
-                       associated_data: bytes = b"") -> bytes:
+
+    def ratchet_decrypt(self, ciphertext: bytes, header: dict) -> bytes:
         """
         Decrypt message and advance ratchet if needed.
-        
+
+        All state changes are applied to a trial copy and only committed once
+        decryption authenticates. Otherwise a forged or corrupted message would
+        leave the chain advanced and desynchronize the session permanently —
+        a trivial denial of service.
+
         Args:
             ciphertext: Encrypted message
-            header: Message header with dh_public, message_number, previous_chain_length
-            associated_data: Additional authenticated data
-        
+            header: Message header, exactly as received
+
+        Returns:
+            Decrypted plaintext
+
+        Raises:
+            InvalidTag: If the ciphertext or header fails authentication
+        """
+        trial_state = copy.deepcopy(self.state)
+        plaintext = self._decrypt_into(trial_state, ciphertext, header)
+
+        # Authenticated — safe to commit
+        self.state = trial_state
+        return plaintext
+
+    def _decrypt_into(self, state: RatchetState, ciphertext: bytes, header: dict) -> bytes:
+        """
+        Decrypt against `state`, mutating it. Raises before/without committing
+        if authentication fails.
+
+        Args:
+            state: Ratchet state to advance (a trial copy)
+            ciphertext: Encrypted message
+            header: Message header, exactly as received
+
         Returns:
             Decrypted plaintext
         """
+        associated_data = _header_ad(header)
+
         header_dh = bytes.fromhex(header['dh_public'])
         msg_num = header['message_number']
         prev_chain_len = header['previous_chain_length']
-        
+
         # Check if this is a new DH ratchet step
-        if self.state.dh_peer is None or header_dh != self.state.dh_peer:
+        if state.dh_peer is None or header_dh != state.dh_peer:
             # Skip messages from previous chain if needed
-            self._skip_message_keys(prev_chain_len)
-            
+            self._skip_message_keys(state, prev_chain_len)
+
             # Perform DH ratchet step
-            self._dh_ratchet(header_dh)
-        
-        # Try to decrypt with skipped keys first (out-of-order)
-        skipped_key = self.state.skipped_message_keys.get((header_dh.hex(), msg_num))
+            self._dh_ratchet(state, header_dh)
+
+        # Try to decrypt with skipped keys first (out-of-order).
+        # Popping from the trial copy means a failed decrypt does not burn the key.
+        skipped_key = state.skipped_message_keys.pop((header_dh.hex(), msg_num), None)
         if skipped_key:
-            del self.state.skipped_message_keys[(header_dh.hex(), msg_num)]
             return self.encryptor.aes_gcm_decrypt(ciphertext, skipped_key, associated_data)
-        
+
         # Skip messages if this message number is ahead
-        self._skip_message_keys(msg_num)
-        
+        self._skip_message_keys(state, msg_num)
+
         # Derive message key
-        self.state.chain_key_recv, message_key = kdf_ck(self.state.chain_key_recv)
-        self.state.message_number_recv += 1
-        
+        state.chain_key_recv, message_key = kdf_ck(state.chain_key_recv)
+        state.message_number_recv += 1
+
         # Decrypt
         return self.encryptor.aes_gcm_decrypt(ciphertext, message_key, associated_data)
-    
-    def _dh_ratchet(self, peer_public_key: bytes):
+
+    def _dh_ratchet(self, state: RatchetState, peer_public_key: bytes):
         """
         Perform DH ratchet step.
-        
+
         This is called when we receive a message with a new DH public key.
         It provides forward secrecy by generating new keys.
-        
+
         Args:
+            state: Ratchet state to advance
             peer_public_key: Peer's new DH public key
         """
         # Store previous chain length
-        self.state.previous_chain_length = self.state.message_number_send
-        
+        state.previous_chain_length = state.message_number_send
+
         # Reset message numbers
-        self.state.message_number_send = 0
-        self.state.message_number_recv = 0
-        
+        state.message_number_send = 0
+        state.message_number_recv = 0
+
         # Update peer's DH public key
-        self.state.dh_peer = peer_public_key
-        
+        state.dh_peer = peer_public_key
+
         # Perform DH with our current key
-        dh_self = X25519KeyPair.from_private_bytes(self.state.dh_self_private)
+        dh_self = X25519KeyPair.from_private_bytes(state.dh_self_private)
         dh_output = dh_self.dh(peer_public_key)
-        
+
         # Update root key and receiving chain
-        self.state.root_key, self.state.chain_key_recv = kdf_rk(
-            self.state.root_key, dh_output
-        )
-        
+        state.root_key, state.chain_key_recv = kdf_rk(state.root_key, dh_output)
+
         # Generate new DH key pair
         new_dh = X25519KeyPair()
-        self.state.dh_self_private = new_dh.get_private_bytes()
-        self.state.dh_self_public = new_dh.get_public_bytes()
-        
+        state.dh_self_private = new_dh.get_private_bytes()
+        state.dh_self_public = new_dh.get_public_bytes()
+
         # Perform DH with new key
         dh_output = new_dh.dh(peer_public_key)
-        
+
         # Update root key and sending chain
-        self.state.root_key, self.state.chain_key_send = kdf_rk(
-            self.state.root_key, dh_output
-        )
-    
-    def _skip_message_keys(self, until: int):
+        state.root_key, state.chain_key_send = kdf_rk(state.root_key, dh_output)
+
+    def _skip_message_keys(self, state: RatchetState, until: int):
         """
         Store keys for skipped messages (out-of-order handling).
-        
+
         Args:
+            state: Ratchet state to advance
             until: Message number to skip until
-        
+
         Raises:
             Exception: If too many messages would be skipped
         """
-        if self.state.message_number_recv + self.MAX_SKIP < until:
-            raise Exception(f"Too many skipped messages: {until - self.state.message_number_recv}")
-        
-        if self.state.chain_key_recv is not None:
-            while self.state.message_number_recv < until:
-                ck, mk = kdf_ck(self.state.chain_key_recv)
-                
+        if state.message_number_recv + self.MAX_SKIP < until:
+            raise Exception(f"Too many skipped messages: {until - state.message_number_recv}")
+
+        if state.chain_key_recv is not None:
+            while state.message_number_recv < until:
+                ck, mk = kdf_ck(state.chain_key_recv)
+
                 # Store skipped message key
-                key = (self.state.dh_peer.hex(), self.state.message_number_recv)
-                self.state.skipped_message_keys[key] = mk
-                
-                self.state.chain_key_recv = ck
-                self.state.message_number_recv += 1
+                key = (state.dh_peer.hex(), state.message_number_recv)
+                state.skipped_message_keys[key] = mk
+
+                state.chain_key_recv = ck
+                state.message_number_recv += 1
 
 
 # Test function
@@ -352,10 +421,73 @@ if __name__ == "__main__":
         assert dec == msg
     
     print("[OK] Multiple messages exchanged successfully")
-    
+
+    # Extra header fields must round-trip and be bound
+    ct, hdr = alice_ratchet.ratchet_encrypt(b"bound", extra_header={'sender': 'alice'})
+    assert hdr['sender'] == 'alice'
+    assert bob_ratchet.ratchet_decrypt(ct, hdr) == b"bound"
+    print("[OK] Extra header fields round-trip")
+
+    # Callers must not be able to forge ratchet-owned fields
+    try:
+        alice_ratchet.ratchet_encrypt(b"x", extra_header={'message_number': 999})
+        raise AssertionError("Reserved header field was accepted!")
+    except ValueError:
+        print("[OK] Reserved header field rejected")
+
+    # --- Header tampering must be detected ---
+    ct, hdr = alice_ratchet.ratchet_encrypt(b"secret", extra_header={'sender': 'alice'})
+
+    # 1. Forged sender
+    forged = dict(hdr, sender='mallory')
+    try:
+        bob_ratchet.ratchet_decrypt(ct, forged)
+        raise AssertionError("Forged sender was accepted!")
+    except AssertionError:
+        raise
+    except Exception:
+        print("[OK] Forged sender rejected")
+
+    # 2. Swapped dh_public — the attack the AD binding exists to stop
+    swapped = dict(hdr, dh_public=X25519KeyPair().get_public_bytes().hex())
+    try:
+        bob_ratchet.ratchet_decrypt(ct, swapped)
+        raise AssertionError("Swapped dh_public was accepted!")
+    except AssertionError:
+        raise
+    except Exception:
+        print("[OK] Swapped dh_public rejected")
+
+    # 3. Bumped message_number
+    bumped = dict(hdr, message_number=hdr['message_number'] + 1)
+    try:
+        bob_ratchet.ratchet_decrypt(ct, bumped)
+        raise AssertionError("Bumped message_number was accepted!")
+    except AssertionError:
+        raise
+    except Exception:
+        print("[OK] Bumped message_number rejected")
+
+    # 4. After all those failures the session must still work — a rejected
+    #    forgery must not have advanced or corrupted Bob's state.
+    assert bob_ratchet.ratchet_decrypt(ct, hdr) == b"secret"
+    print("[OK] Session survives rejected forgeries")
+
+    followup = b"still alive"
+    ct2, hdr2 = alice_ratchet.ratchet_encrypt(followup, extra_header={'sender': 'alice'})
+    assert bob_ratchet.ratchet_decrypt(ct2, hdr2) == followup
+    print("[OK] Conversation continues after tampering attempts")
+
+    # Out-of-order delivery still works with AD binding in place
+    ct_a, hdr_a = alice_ratchet.ratchet_encrypt(b"first", extra_header={'sender': 'alice'})
+    ct_b, hdr_b = alice_ratchet.ratchet_encrypt(b"second", extra_header={'sender': 'alice'})
+    assert bob_ratchet.ratchet_decrypt(ct_b, hdr_b) == b"second"  # arrives early
+    assert bob_ratchet.ratchet_decrypt(ct_a, hdr_a) == b"first"   # skipped key
+    print("[OK] Out-of-order delivery works")
+
     # Test state serialization
     alice_dict = alice_state.to_dict()
     alice_restored = RatchetState.from_dict(alice_dict)
     print("[OK] State serialization works")
-    
+
     print("\n[PASS] All Double Ratchet tests passed!")

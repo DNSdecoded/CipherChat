@@ -42,13 +42,17 @@ def generate_certificates():
         subprocess.run(key_cmd, check=True, capture_output=True)
         
         # Generate self-signed certificate (valid for 365 days)
+        # subjectAltName is required: clients enable hostname checking, and
+        # modern TLS stacks ignore CN entirely. Without these SANs every
+        # connection fails verification. Must match generate_certs_python.py.
         cert_cmd = [
             'openssl', 'req',
             '-new', '-x509',
             '-key', config.SERVER_KEY,
             '-out', config.SERVER_CERT,
             '-days', '365',
-            '-subj', '/C=US/ST=State/L=City/O=Organization/CN=localhost'
+            '-subj', '/C=US/ST=State/L=City/O=Organization/CN=localhost',
+            '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1'
         ]
         
         print(f"Generating certificate: {config.SERVER_CERT}")

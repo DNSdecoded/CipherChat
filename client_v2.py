@@ -25,7 +25,10 @@ import config
 
 # Forward Secrecy imports
 if config.E2E_ENABLED:
-    from x3dh import X3DHKeyManager, X3DHPreKeyBundle, x3dh_initiate, x3dh_respond
+    from x3dh import (
+        X3DHKeyManager, X3DHPreKeyBundle, x3dh_initiate, x3dh_respond,
+        verify_prekey_bundle,
+    )
     from double_ratchet import RatchetState, DoubleRatchet
     from x25519_utils import X25519KeyPair, generate_fingerprint, generate_safety_number
 
@@ -33,13 +36,17 @@ if config.E2E_ENABLED:
 class ChatClient:
     """Encrypted chat client with Forward Secrecy and dual-stack support."""
     
-    PROTOCOL_VERSION = "2.0"  # Forward Secrecy protocol
-    
-    def __init__(self, server_host, server_port, username, verify_cert=False):
+    PROTOCOL_VERSION = "3.0"  # Ed25519-signed bundles + AEAD-bound headers
+
+    # Mirrors ChatServer.MAX_BUFFER_SIZE; a hostile or broken server can flood
+    # the client just as easily as the reverse.
+    MAX_BUFFER_SIZE = 64 * 1024
+
+
+    def __init__(self, server_host, server_port, username):
         self.server_host = server_host
         self.server_port = server_port
         self.username = username
-        self.verify_cert = verify_cert
         self.socket = None
         self.running = False
         self.address_family = None
@@ -71,14 +78,23 @@ class ChatClient:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         
-        if self.verify_cert:
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
-            ssl_context.check_hostname = True
+        # Pin the self-signed server certificate. Without this the transport is
+        # unauthenticated and anyone on the path can terminate TLS, read every
+        # key bundle, and substitute their own — defeating E2E before it starts.
+        # The operator distributes certs/server.crt to clients out-of-band.
+        try:
             ssl_context.load_verify_locations(config.SERVER_CERT)
-        else:
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-        
+        except FileNotFoundError:
+            print(f"[ERROR] Server certificate not found: {config.SERVER_CERT}",
+                  file=sys.stderr)
+            print("        Obtain it from the server operator, or run "
+                  "'python generate_certs.py' if you run the server yourself.",
+                  file=sys.stderr)
+            raise
+
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        ssl_context.check_hostname = True
+
         return ssl_context
     
     def detect_address_family(self):
@@ -114,11 +130,12 @@ class ChatClient:
             raw_socket.connect((self.server_host, self.server_port))
             
             ssl_context = self.create_ssl_context()
+            # server_hostname drives certificate hostname checking; None disables it
             self.socket = ssl_context.wrap_socket(
                 raw_socket,
-                server_hostname=None
+                server_hostname=self.server_host
             )
-            
+
             print(f"[OK] Connected via {protocol_name}")
             print(f"[OK] TLS encryption enabled ({self.socket.version()})")
             print("=" * 60)
@@ -157,8 +174,13 @@ class ChatClient:
             raw_socket.connect((config.CLIENT_LOCALHOST_IPV4, self.server_port))
             
             ssl_context = self.create_ssl_context()
-            self.socket = ssl_context.wrap_socket(raw_socket, server_hostname=None)
-            
+            # Must match the address actually dialled, not the original hostname,
+            # or hostname checking fails against the cert's IP SAN.
+            self.socket = ssl_context.wrap_socket(
+                raw_socket,
+                server_hostname=config.CLIENT_LOCALHOST_IPV4
+            )
+
             print(f"[OK] Connected via IPv4")
             print(f"[OK] TLS encryption enabled ({self.socket.version()})")
             print("=" * 60)
@@ -180,8 +202,9 @@ class ChatClient:
         print("[E2E] Generating X3DH key bundle...")
         bundle = self.x3dh_manager.get_prekey_bundle()
         
-        # Display identity key fingerprint
-        fingerprint = generate_fingerprint(self.x3dh_manager.identity_keypair.get_public_bytes())
+        # Display signing key fingerprint. This must be the key TOFU pins, or
+        # what users compare out-of-band would not be what is actually verified.
+        fingerprint = generate_fingerprint(self.x3dh_manager.signing_keypair.get_public_bytes())
         print(f"[E2E] Identity key fingerprint:")
         print(f"      {fingerprint}")
         print(f"[E2E] Protocol: Signal (X3DH + Double Ratchet)")
@@ -192,7 +215,7 @@ class ChatClient:
             'type': 'join',
             'username': self.username,
             'x3dh_bundle': bundle.to_dict(),
-            'protocol_version': '2.0'
+            'protocol_version': self.PROTOCOL_VERSION
         }
         self.send_message(join_msg)
     
@@ -205,33 +228,81 @@ class ChatClient:
             print(f"\n[ERROR] Send failed: {e}", file=sys.stderr)
             self.running = False
     
+    TRUSTED_KEYS_VERSION = 2  # v2 pins the Ed25519 signing key, v1 pinned X25519
+
     def load_trusted_keys(self):
-        """Load trusted identity keys from disk (TOFU)."""
+        """Load trusted signing keys from disk (TOFU)."""
+        self.trusted_keys = {}
         try:
-            if os.path.exists(self.trusted_keys_file):
-                with open(self.trusted_keys_file, 'r') as f:
-                    self.trusted_keys = json.load(f)
-                print(f"[TOFU] Loaded {len(self.trusted_keys)} trusted key(s)")
+            if not os.path.exists(self.trusted_keys_file):
+                return
+
+            with open(self.trusted_keys_file, 'r') as f:
+                data = json.load(f)
+
+            # A v1 file pinned X25519 identity keys. Those are not the keys we
+            # verify against any more, so migrating them would pin the wrong
+            # thing and silently defeat the check. Discard and re-TOFU instead.
+            if not isinstance(data, dict) or data.get('version') != self.TRUSTED_KEYS_VERSION:
+                print(f"[TOFU] Ignoring outdated {self.trusted_keys_file} "
+                      f"(pre-v{self.TRUSTED_KEYS_VERSION} format).")
+                print("[TOFU] All peers will be treated as first contact — "
+                      "re-verify fingerprints out-of-band.")
+                return
+
+            self.trusted_keys = data.get('keys', {})
+            print(f"[TOFU] Loaded {len(self.trusted_keys)} trusted key(s)")
         except Exception as e:
             print(f"[WARN] Could not load trusted keys: {e}")
             self.trusted_keys = {}
-    
+
     def save_trusted_keys(self):
-        """Save trusted identity keys to disk."""
+        """Save trusted signing keys to disk with owner-only permissions."""
+        payload = {'version': self.TRUSTED_KEYS_VERSION, 'keys': self.trusted_keys}
         try:
-            with open(self.trusted_keys_file, 'w') as f:
-                json.dump(self.trusted_keys, f, indent=2)
+            # 0600 so other local users cannot read or tamper with the pins.
+            # The mode is ignored on Windows; it matters on POSIX.
+            fd = os.open(
+                self.trusted_keys_file,
+                os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+                0o600
+            )
+            with os.fdopen(fd, 'w') as f:
+                json.dump(payload, f, indent=2)
         except Exception as e:
             print(f"[WARN] Could not save trusted keys: {e}")
-    
-    def verify_identity_key(self, username: str, identity_key: bytes) -> bool:
+
+    def _accept_peer_bundle(self, username: str, bundle) -> bool:
         """
-        Verify identity key using TOFU (Trust-on-First-Use).
-        
+        Decide whether to accept a peer's pre-key bundle.
+
+        Two independent checks, both required:
+        1. The bundle is internally consistent — its signed pre-key and identity
+           key really were signed by its signing key. Catches a tampered bundle.
+        2. The signing key matches what we pinned for this username (TOFU).
+           Catches a wholesale substituted bundle, which would pass check 1.
+
         Args:
             username: Peer username
-            identity_key: Peer's identity public key
-        
+            bundle: X3DHPreKeyBundle received from the server
+
+        Returns:
+            True if the bundle should be trusted
+        """
+        if not verify_prekey_bundle(bundle):
+            print(f"\n[SECURITY] Bundle from {username} has an invalid signature — rejected.")
+            return False
+
+        return self.verify_identity_key(username, bundle.signing_key)
+
+    def verify_identity_key(self, username: str, identity_key: bytes) -> bool:
+        """
+        Verify a peer's signing key using TOFU (Trust-on-First-Use).
+
+        Args:
+            username: Peer username
+            identity_key: Peer's Ed25519 signing public key
+
         Returns:
             True if key is trusted, False if rejected
         """
@@ -317,15 +388,24 @@ class ChatClient:
                     
                     ratchet = self.ratchet_states[peer]
                 
-                # Encrypt with ratchet
-                ciphertext, header = ratchet.ratchet_encrypt(plaintext.encode())
-                
+                # Build the complete header BEFORE encrypting. Every field here
+                # is bound into the AEAD tag, so nothing may be added afterwards.
+                extra_header = {'sender': self.username}
+
                 # Include X3DH ephemeral key in first message if this is the initiator
-                if hasattr(ratchet, 'x3dh_ephemeral_pub'):
-                    header['x3dh_ephemeral'] = ratchet.x3dh_ephemeral_pub.hex()
-                    # Remove it after first use
+                is_first_message = hasattr(ratchet, 'x3dh_ephemeral_pub')
+                if is_first_message:
+                    extra_header['x3dh_ephemeral'] = ratchet.x3dh_ephemeral_pub.hex()
+
+                # Encrypt with ratchet
+                ciphertext, header = ratchet.ratchet_encrypt(
+                    plaintext.encode(), extra_header=extra_header
+                )
+
+                # Only drop the ephemeral key once it has actually been sent
+                if is_first_message:
                     delattr(ratchet, 'x3dh_ephemeral_pub')
-                
+
                 # Send ratchet message
                 msg = {
                     'type': 'ratchet_message',
@@ -409,7 +489,13 @@ class ChatClient:
                     break
                 
                 buffer += data.decode('utf-8')
-                
+
+                if len(buffer) > self.MAX_BUFFER_SIZE:
+                    print("\n[ERROR] Server sent an oversized message; disconnecting.",
+                          file=sys.stderr)
+                    self.running = False
+                    break
+
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
                     if line.strip():
@@ -438,13 +524,15 @@ class ChatClient:
             bundles_dict = message.get('bundles', {})
             with self.bundles_lock:
                 for username, bundle_dict in bundles_dict.items():
-                    bundle = X3DHPreKeyBundle.from_dict(bundle_dict)
-                    
-                    # TOFU: Verify identity key
-                    if not self.verify_identity_key(username, bundle.identity_key):
-                        print(f"[SECURITY] Rejected bundle from {username} - key verification failed")
+                    try:
+                        bundle = X3DHPreKeyBundle.from_dict(bundle_dict)
+                    except (KeyError, ValueError, TypeError):
+                        print(f"[SECURITY] Malformed bundle for {username} - ignored")
                         continue
-                    
+
+                    if not self._accept_peer_bundle(username, bundle):
+                        continue
+
                     self.peer_bundles[username] = bundle
                 self.keys_initialized = True
             
@@ -458,13 +546,15 @@ class ChatClient:
             username = message.get('username')
             bundle_dict = message.get('bundle')
             if username and bundle_dict:
-                bundle = X3DHPreKeyBundle.from_dict(bundle_dict)
-                
-                # TOFU: Verify identity key
-                if not self.verify_identity_key(username, bundle.identity_key):
-                    print(f"[SECURITY] Rejected bundle from {username} - key verification failed")
+                try:
+                    bundle = X3DHPreKeyBundle.from_dict(bundle_dict)
+                except (KeyError, ValueError, TypeError):
+                    print(f"[SECURITY] Malformed bundle for {username} - ignored")
                     return
-                
+
+                if not self._accept_peer_bundle(username, bundle):
+                    return
+
                 with self.bundles_lock:
                     self.peer_bundles[username] = bundle
                     self.keys_initialized = True
@@ -540,7 +630,18 @@ class ChatClient:
             
             # Decrypt
             plaintext = ratchet.ratchet_decrypt(ciphertext, header)
-            
+
+            # The header is AEAD-bound, so its `sender` is what the peer actually
+            # encrypted. The envelope `sender` is only what the server routed by.
+            # A mismatch means someone is claiming another user's messages.
+            claimed = header.get('sender')
+            if claimed != sender:
+                print(f"\n[SECURITY] Dropped message routed as '{sender}' but "
+                      f"signed by '{claimed}'.")
+                sys.stdout.flush()
+                print(f"{self.username}> ", end='', flush=True)
+                return
+
             # Display
             try:
                 dt = datetime.fromisoformat(timestamp)
@@ -556,10 +657,11 @@ class ChatClient:
             sys.stdout.flush()
             print(f"{self.username}> ", end='', flush=True)
             
-        except Exception as e:
-            print(f"\n[ERROR] Decryption failed from {sender}: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            # Deliberately generic: the exception text and traceback expose
+            # ratchet internals, and a peer can trigger this at will.
+            print(f"\n[WARN] Could not decrypt a message from {sender} "
+                  f"(tampered, replayed, or out of sync).", file=sys.stderr)
             sys.stdout.flush()
             print(f"{self.username}> ", end='', flush=True)
     
@@ -674,7 +776,7 @@ def main():
         print("[ERROR] Invalid port number", file=sys.stderr)
         return
     
-    client = ChatClient(server, port, username, verify_cert=False)
+    client = ChatClient(server, port, username)
     
     try:
         client.start()
