@@ -4,6 +4,10 @@ certs/
 # Client-side TOFU trust store (per-user identity key pins)
 trusted_keys.json
 
+# Encrypted identity + ratchet state (passphrase-protected, but still secrets)
+ratchet_state_*.json
+.ratchet-*.tmp
+
 # Runtime
 server.log
 *.log

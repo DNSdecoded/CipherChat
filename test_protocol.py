@@ -395,7 +395,66 @@ def main():
 
     check("pool depletion falls back to 3-DH", test_onetime_depletion)
 
-    # --- 9. Buffer bound drops a flooding connection ---
+    # --- 9. Persistence: identity and sessions survive a restart ---
+    def test_persistence():
+        import shutil
+        import tempfile as _tempfile
+        from ratchet_store import RatchetStore
+        from x3dh import X3DHKeyManager
+
+        workdir = _tempfile.mkdtemp()
+        try:
+            path = os.path.join(workdir, 'state.json')
+            store = RatchetStore('persist', 'a strong passphrase', path=path)
+
+            # Establish a session and advance the ratchet a few messages
+            alice, bob = pair('persist', 'partner')
+            original_signing = alice.keys.signing_keypair.get_public_bytes()
+
+            ciphertext, header = alice.encrypt_to('partner', "msg one")
+            bob_ratchet = bob.responder_ratchet(header, 'persist')
+            assert bob_ratchet.ratchet_decrypt(ciphertext, header) == b"msg one"
+
+            for i in range(3):
+                ct, hdr = alice.encrypt_to('partner', f"msg {i}")
+                assert bob_ratchet.ratchet_decrypt(ct, hdr) == f"msg {i}".encode()
+
+            # Persist Alice's identity and live session
+            store.save({
+                'username': 'persist',
+                'x3dh': alice.keys.export_private_state(),
+                'ratchets': {'partner': alice.ratchets['partner'].state.to_dict()},
+            })
+
+            # "Restart": rebuild purely from disk
+            saved = store.load()
+            restored_keys = X3DHKeyManager.from_private_state(saved['x3dh'])
+
+            # The identity peers pinned must be byte-identical, or every peer
+            # sees a key-change warning
+            assert restored_keys.signing_keypair.get_public_bytes() == original_signing, \
+                "signing key changed across restart - TOFU pins would break"
+            assert restored_keys.identity_keypair.get_public_bytes() == \
+                alice.keys.identity_keypair.get_public_bytes()
+
+            # Unused one-time keys must survive too
+            assert set(restored_keys.onetime_prekeys) == set(alice.keys.onetime_prekeys)
+
+            # The restored ratchet must continue the conversation, not restart it
+            restored = DoubleRatchet(RatchetState.from_dict(saved['ratchets']['partner']))
+            ct, hdr = restored.ratchet_encrypt(
+                b"after restart", extra_header={'sender': 'persist'}
+            )
+            assert bob_ratchet.ratchet_decrypt(ct, hdr) == b"after restart", \
+                "restored ratchet could not continue the session"
+
+            alice.close(); bob.close()
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    check("identity and session survive a restart", test_persistence)
+
+    # --- 10. Buffer bound drops a flooding connection ---
     def test_buffer_bound():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(config.SERVER_CERT)

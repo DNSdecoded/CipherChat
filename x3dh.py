@@ -161,6 +161,67 @@ class X3DHKeyManager:
     def onetime_prekey_count(self) -> int:
         """Number of unused one-time pre-keys still held."""
         return len(self.onetime_prekeys)
+
+    def export_private_state(self) -> dict:
+        """
+        Serialize every private key for encrypted storage.
+
+        The identity and signing keys must be included: peers pin the signing key
+        via TOFU, so regenerating it on restart would look exactly like a
+        man-in-the-middle attack to everyone who has talked to us before.
+
+        The output contains raw private keys. It is only ever safe to write this
+        through RatchetStore, which encrypts it.
+
+        Returns:
+            JSON-serializable dict of secrets
+        """
+        return {
+            'identity_private': self.identity_keypair.get_private_bytes().hex(),
+            'signing_private': self.signing_keypair.get_private_bytes().hex(),
+            'signed_prekey_private': self.signed_prekey_pair.get_private_bytes().hex(),
+            # JSON object keys must be strings; ids are restored back to int
+            'onetime_prekeys': {
+                str(key_id): pair.get_private_bytes().hex()
+                for key_id, pair in self.onetime_prekeys.items()
+            },
+            'next_onetime_id': self._next_onetime_id,
+        }
+
+    @classmethod
+    def from_private_state(cls, data: dict) -> 'X3DHKeyManager':
+        """
+        Rebuild a key manager from export_private_state().
+
+        Args:
+            data: Dict previously produced by export_private_state()
+
+        Returns:
+            X3DHKeyManager holding the original keys
+
+        Raises:
+            KeyError, ValueError: if the stored state is malformed
+        """
+        # __init__ generates a throwaway set first; that costs microseconds and
+        # keeps construction in one place rather than duplicating field setup.
+        manager = cls()
+
+        manager.identity_keypair = X25519KeyPair.from_private_bytes(
+            bytes.fromhex(data['identity_private'])
+        )
+        manager.signing_keypair = Ed25519KeyPair.from_private_bytes(
+            bytes.fromhex(data['signing_private'])
+        )
+        manager.signed_prekey_pair = X25519KeyPair.from_private_bytes(
+            bytes.fromhex(data['signed_prekey_private'])
+        )
+        manager.onetime_prekeys = {
+            int(key_id): X25519KeyPair.from_private_bytes(bytes.fromhex(private_hex))
+            for key_id, private_hex in data.get('onetime_prekeys', {}).items()
+        }
+        manager._next_onetime_id = data.get('next_onetime_id', 0)
+
+        return manager
     
     def get_prekey_bundle(self) -> X3DHPreKeyBundle:
         """

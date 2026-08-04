@@ -11,6 +11,7 @@ import json
 import sys
 import os
 import base64
+import getpass
 
 # Configure stdout for UTF-8 on Windows
 if sys.platform == 'win32':
@@ -31,6 +32,7 @@ if config.E2E_ENABLED:
     )
     from double_ratchet import RatchetState, DoubleRatchet
     from x25519_utils import X25519KeyPair, generate_fingerprint, generate_safety_number
+    from ratchet_store import RatchetStore, RatchetStoreError
 
 
 class ChatClient:
@@ -43,20 +45,23 @@ class ChatClient:
     MAX_BUFFER_SIZE = 64 * 1024
 
 
-    def __init__(self, server_host, server_port, username):
+    def __init__(self, server_host, server_port, username, store=None):
         self.server_host = server_host
         self.server_port = server_port
         self.username = username
         self.socket = None
         self.running = False
         self.address_family = None
-        
+
+        # Encrypted at-rest state; a disabled store makes every call a no-op
+        self.store = store or RatchetStore(username, "")
+
         # Forward Secrecy (X3DH + Double Ratchet)
         self.e2e_enabled = config.E2E_ENABLED
         if self.e2e_enabled:
             # X3DH key manager
             self.x3dh_manager = X3DHKeyManager()
-            
+
             # Ratchet states for each peer
             self.ratchet_states = {}  # {username: DoubleRatchet}
             self.ratchet_lock = threading.Lock()
@@ -72,6 +77,71 @@ class ChatClient:
             self.trusted_keys = {}  # {username: identity_key_hex}
             self.trusted_keys_file = 'trusted_keys.json'
             self.load_trusted_keys()
+
+            # Restore identity and sessions before anything touches the network
+            self.restore_state()
+
+    def restore_state(self):
+        """
+        Load persisted identity keys and ratchet sessions, if any.
+
+        Must run before generate_keys(), because the bundle we publish has to be
+        built from the restored identity — publishing a fresh one would trip
+        every peer's TOFU warning.
+        """
+        try:
+            saved = self.store.load()
+        except RatchetStoreError as e:
+            # Refuse to silently continue with a new identity: that is exactly
+            # what an attacker who deleted the file would want.
+            print(f"\n[ERROR] {e}", file=sys.stderr)
+            print(f"[ERROR] Delete {self.store.path} to start over with a NEW "
+                  f"identity (all peers will see a key-change warning).",
+                  file=sys.stderr)
+            raise SystemExit(1)
+
+        if not saved:
+            if self.store.enabled:
+                print("[STORE] No saved state; creating a new identity")
+            return
+
+        try:
+            self.x3dh_manager = X3DHKeyManager.from_private_state(saved['x3dh'])
+            for peer, state_dict in saved.get('ratchets', {}).items():
+                self.ratchet_states[peer] = DoubleRatchet(
+                    RatchetState.from_dict(state_dict)
+                )
+        except (KeyError, ValueError, TypeError) as e:
+            print(f"\n[ERROR] Saved state is unusable: {e}", file=sys.stderr)
+            raise SystemExit(1)
+
+        print(f"[STORE] Restored identity and {len(self.ratchet_states)} session(s)")
+
+    def save_state(self):
+        """
+        Persist identity keys and every ratchet session.
+
+        Called after each send and each successful decrypt: the ratchet advances
+        on both, and a state file that lags the wire cannot decrypt what arrives
+        next.
+        """
+        if not self.store.enabled or not self.e2e_enabled:
+            return
+
+        try:
+            with self.ratchet_lock:
+                ratchets = {
+                    peer: ratchet.state.to_dict()
+                    for peer, ratchet in self.ratchet_states.items()
+                }
+            self.store.save({
+                'username': self.username,
+                'x3dh': self.x3dh_manager.export_private_state(),
+                'ratchets': ratchets,
+            })
+        except Exception as e:
+            # Never let a storage failure kill a live conversation
+            print(f"\n[WARN] Could not save state: {e}", file=sys.stderr)
     
     def create_ssl_context(self):
         """Create SSL context for TLS encryption."""
@@ -430,6 +500,9 @@ class ChatClient:
                 
             except Exception as e:
                 print(f"\n[ERROR] Failed to encrypt for {peer}: {e}", file=sys.stderr)
+
+        # The sending chain advanced; persist before the next message
+        self.save_state()
     
     def _initialize_ratchet_with_peer(self, peer_username: str):
         """
@@ -696,7 +769,11 @@ class ChatClient:
                 print(f"\n[{time_str}] [FS] {sender}: {plaintext.decode()}")
             else:
                 print(f"\n[FS] {sender}: {plaintext.decode()}")
-            
+
+            # Receiving chain advanced (and a one-time key may have been
+            # consumed); persist so a restart does not replay or desync
+            self.save_state()
+
             sys.stdout.flush()
             print(f"{self.username}> ", end='', flush=True)
             
@@ -809,9 +886,15 @@ def main():
             username = "Anonymous"
         
         username = username[:config.USERNAME_MAX_LENGTH]
-        
+
         print()
-        
+        print("A passphrase encrypts your identity and sessions on disk, so peers")
+        print("do not see a key-change warning every time you restart.")
+        print("Leave blank to keep everything in memory only (previous behaviour).")
+        passphrase = getpass.getpass("Passphrase (blank for none): ")
+
+        print()
+
     except KeyboardInterrupt:
         print("\n\nCancelled.")
         return
@@ -819,7 +902,15 @@ def main():
         print("[ERROR] Invalid port number", file=sys.stderr)
         return
     
-    client = ChatClient(server, port, username)
+    store = RatchetStore(username, passphrase)
+    if store.enabled and not store.exists():
+        # New store: make sure a typo does not lock the user out of an identity
+        # their peers are about to pin.
+        if getpass.getpass("Confirm passphrase: ") != passphrase:
+            print("[ERROR] Passphrases do not match.", file=sys.stderr)
+            return
+
+    client = ChatClient(server, port, username, store=store)
     
     try:
         client.start()
