@@ -1,0 +1,17 @@
+# TLS keys and certificates — dev-only, never commit
+certs/
+
+# Client-side TOFU trust store (per-user identity key pins)
+trusted_keys.json
+
+# Runtime
+server.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
