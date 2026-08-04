@@ -519,7 +519,88 @@ def main():
 
     check("offline messages queued and delivered in order", test_offline_queue)
 
-    # --- 11. Buffer bound drops a flooding connection ---
+    # --- 11. Directed messages reach only the addressee ---
+    def test_directed_message():
+        sender = RawClient('router')
+        sender.join(); sender.absorb_bundles()
+        target = RawClient('addressee')
+        target.join(); target.absorb_bundles()
+        bystander = RawClient('nosy')
+        bystander.join(); bystander.absorb_bundles()
+        sender.absorb_bundles()
+        target.absorb_bundles()
+
+        sender.send_to('addressee', "for your eyes only")
+
+        got = target.recv_until('ratchet_message')
+        assert got is not None, "addressee received nothing"
+        ratchet = target.responder_ratchet(got['header'], 'router')
+        assert ratchet.ratchet_decrypt(
+            base64.b64decode(got['ciphertext']), got['header']
+        ) == b"for your eyes only"
+
+        # The bystander must not receive it at all
+        leaked = bystander.recv_until('ratchet_message', timeout=1.0)
+        assert leaked is None, "directed message leaked to a third party"
+
+        sender.close(); target.close(); bystander.close()
+
+    check("directed message reaches only the addressee", test_directed_message)
+
+    # --- 12. Auto-reconnect after the link drops ---
+    def test_reconnect():
+        from client_v2 import ChatClient
+        from ratchet_store import RatchetStore
+
+        # Disabled store keeps this test off the filesystem
+        client = ChatClient('127.0.0.1', TEST_PORT, 'reconnector',
+                            store=RatchetStore('reconnector', ''))
+        client.running = True
+        supervisor = threading.Thread(target=client._network_loop, daemon=True)
+        supervisor.start()
+
+        try:
+            deadline = time.time() + 15
+            while not client.connected and time.time() < deadline:
+                time.sleep(0.1)
+            assert client.connected, "client never made its first connection"
+
+            first_socket = client.socket
+            identity = client.x3dh_manager.signing_keypair.get_public_bytes()
+
+            # Yank the link out from under it
+            try:
+                first_socket.close()
+            except Exception:
+                pass
+
+            # It must come back on its own. The rejoin may first be refused as a
+            # duplicate until the server reaps the dead socket, which is exactly
+            # the case backoff has to survive.
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                if client.connected and client.socket is not first_socket:
+                    break
+                time.sleep(0.2)
+
+            assert client.connected and client.socket is not first_socket, \
+                "client did not reconnect after the link dropped"
+
+            # Identity must be unchanged, or every peer sees a key-change warning
+            assert client.x3dh_manager.signing_keypair.get_public_bytes() == identity, \
+                "identity changed across reconnect"
+        finally:
+            client.running = False
+            client.connected = False
+            try:
+                client.socket.close()
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+    check("client reconnects after the link drops", test_reconnect)
+
+    # --- 13. Buffer bound drops a flooding connection ---
     def test_buffer_bound():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(config.SERVER_CERT)

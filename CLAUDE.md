@@ -95,7 +95,18 @@ adding a field afterwards (as the pre-3.0 code did with `x3dh_ephemeral`) makes 
 decrypt. Pass extras via `extra_header=`; ratchet-owned fields are rejected. Nothing between sender and
 receiver, including the server, may modify the header.
 
-A "broadcast" message is actually N unicast ratchet messages, one per peer, encrypted separately.
+A "broadcast" message is actually N unicast ratchet messages, one per peer, encrypted separately —
+there is no shared group key. `send_encrypted_message(text, recipients=None)` sends to every peer;
+`/msg <user>` passes an explicit list. Slash commands (`/msg`, `/who`, `/verify`, `/help`) are handled
+entirely client-side in `_handle_command` and never reach the server as text.
+
+The client keeps two separate flags: `running` means the user wants the client alive, `connected`
+means a usable socket exists right now. A dropped link must only clear `connected` — clearing
+`running` kills the client instead of letting `_network_loop` reconnect with jittered exponential
+backoff. On reconnect the client republishes its restored bundle (same identity, so no peer sees a
+key change) and resumes existing ratchets rather than re-running X3DH. A rejoin can legitimately be
+refused as a duplicate username while the server has yet to reap the previous socket; the `error`
+handler treats that as a dropped link so backoff retries.
 
 Sender identity is enforced twice: the server overwrites the envelope `sender` with the authenticated
 username, and the receiver checks the AEAD-bound header `sender` against the ratchet that decrypted the

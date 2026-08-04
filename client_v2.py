@@ -12,6 +12,8 @@ import sys
 import os
 import base64
 import getpass
+import random
+import time
 
 # Configure stdout for UTF-8 on Windows
 if sys.platform == 'win32':
@@ -44,13 +46,19 @@ class ChatClient:
     # the client just as easily as the reverse.
     MAX_BUFFER_SIZE = 64 * 1024
 
+    # Reconnect backoff. Jittered so a server restart does not bring every
+    # client back in the same instant.
+    RECONNECT_BASE_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 60.0
+
 
     def __init__(self, server_host, server_port, username, store=None):
         self.server_host = server_host
         self.server_port = server_port
         self.username = username
         self.socket = None
-        self.running = False
+        self.running = False        # user wants the client alive
+        self.connected = False      # a usable socket exists right now
         self.address_family = None
 
         # Encrypted at-rest state; a disabled store makes every call a no-op
@@ -300,12 +308,18 @@ class ChatClient:
     
     def send_message(self, message):
         """Send JSON message to server."""
+        if not self.connected or self.socket is None:
+            print("\n[NET] Not connected - message not sent.", file=sys.stderr)
+            return
+
         try:
             data = json.dumps(message).encode('utf-8')
             self.socket.sendall(data + b'\n')
         except Exception as e:
-            print(f"\n[ERROR] Send failed: {e}", file=sys.stderr)
-            self.running = False
+            # A failed send means the link is gone, not that the client should
+            # exit — the supervisor will reconnect.
+            print(f"\n[NET] Send failed: {e}", file=sys.stderr)
+            self.connected = False
     
     TRUSTED_KEYS_VERSION = 2  # v2 pins the Ed25519 signing key, v1 pinned X25519
 
@@ -438,24 +452,37 @@ class ChatClient:
         # Key matches - trusted
         return True
     
-    def send_encrypted_message(self, plaintext: str):
+    def send_encrypted_message(self, plaintext: str, recipients=None):
         """
         Encrypt and send message using Double Ratchet.
-        Messages are sent individually to each peer.
+
+        Every message is a unicast, encrypted separately per recipient — a
+        "broadcast" is just N of them. There is no shared group key.
+
+        Args:
+            plaintext: Message body
+            recipients: Explicit recipient list, or None to send to every peer
         """
         if not self.e2e_enabled:
             # Fallback to plaintext
             self.send_message({'type': 'message', 'content': plaintext})
             return
-        
-        # Get all peers
+
         with self.bundles_lock:
-            if not self.peer_bundles:
+            known = list(self.peer_bundles.keys())
+
+        if recipients is None:
+            peers = known
+            if not peers:
                 print("\n[WARN] No other users in chat yet.")
                 return
-            
-            peers = list(self.peer_bundles.keys())
-        
+        else:
+            peers = [p for p in recipients if p in known]
+            for missing in (p for p in recipients if p not in known):
+                print(f"\n[WARN] Unknown user '{missing}' - no key bundle for them.")
+            if not peers:
+                return
+
         # Send to each peer individually
         for peer in peers:
             try:
@@ -583,21 +610,22 @@ class ChatClient:
     def receive_messages(self):
         """Receive and handle messages from server."""
         buffer = ""
-        
-        while self.running:
+
+        # Ends the SESSION, not the client: the supervisor reconnects.
+        while self.running and self.connected:
             try:
                 data = self.socket.recv(config.BUFFER_SIZE)
                 if not data:
-                    print("\n[ERROR] Connection closed by server")
-                    self.running = False
+                    print("\n[NET] Connection closed by server")
+                    self.connected = False
                     break
-                
+
                 buffer += data.decode('utf-8')
 
                 if len(buffer) > self.MAX_BUFFER_SIZE:
                     print("\n[ERROR] Server sent an oversized message; disconnecting.",
                           file=sys.stderr)
-                    self.running = False
+                    self.connected = False
                     break
 
                 while '\n' in buffer:
@@ -610,13 +638,13 @@ class ChatClient:
                             pass
                 
             except ConnectionResetError:
-                print("\n[ERROR] Connection reset")
-                self.running = False
+                print("\n[NET] Connection reset")
+                self.connected = False
                 break
             except Exception as e:
-                if self.running:
-                    print(f"\n[ERROR] Receive error: {e}", file=sys.stderr)
-                    self.running = False
+                if self.running and self.connected:
+                    print(f"\n[NET] Receive error: {e}", file=sys.stderr)
+                self.connected = False
                 break
     
     def _handle_message(self, message: dict):
@@ -673,6 +701,18 @@ class ChatClient:
                 'onetime_prekeys': entries,
             })
             print(f"\n[E2E] Uploaded {len(entries)} fresh one-time pre-key(s)")
+
+        elif msg_type == 'error':
+            content = message.get('content', 'Server reported an error')
+            print(f"\n[SERVER] {content}")
+
+            # A rejected JOIN is usually the server not having noticed our
+            # previous socket die yet. Drop the link and let backoff retry
+            # rather than killing a client that is simply early.
+            if 'taken' in content.lower() or 'upgrade' in content.lower():
+                self.connected = False
+            sys.stdout.flush()
+            print(f"{self.username}> ", end='', flush=True)
 
         elif msg_type == 'presence':
             # A peer went offline. Deliberately keep their bundle AND their
@@ -785,19 +825,92 @@ class ChatClient:
             sys.stdout.flush()
             print(f"{self.username}> ", end='', flush=True)
     
+    def _handle_command(self, line: str) -> bool:
+        """
+        Handle a /command.
+
+        Args:
+            line: Raw input beginning with '/'
+
+        Returns:
+            True if handled, False if it should be sent as an ordinary message
+        """
+        parts = line[1:].split(' ', 1)
+        command = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ''
+
+        if command == 'help':
+            print("\nCommands:")
+            print("  /msg <user> <text>  Send to one person only")
+            print("  /who                List users you hold keys for")
+            print("  /verify <user>      Show the safety number to compare out-of-band")
+            print("  /help               This list")
+            print("Anything else is encrypted separately to every peer.")
+
+        elif command == 'who':
+            with self.bundles_lock:
+                peers = sorted(self.peer_bundles)
+            if peers:
+                print(f"\nUsers you can message ({len(peers)}):")
+                for peer in peers:
+                    with self.ratchet_lock:
+                        active = peer in self.ratchet_states
+                    print(f"  {peer}{'  [session active]' if active else ''}")
+            else:
+                print("\nNo other users known yet.")
+
+        elif command == 'msg':
+            target, _, body = rest.partition(' ')
+            if not target or not body.strip():
+                print("\nUsage: /msg <user> <text>")
+            else:
+                self.send_encrypted_message(body.strip(), recipients=[target])
+
+        elif command == 'verify':
+            if not rest:
+                print("\nUsage: /verify <user>")
+            else:
+                with self.bundles_lock:
+                    bundle = self.peer_bundles.get(rest)
+                if not bundle:
+                    print(f"\n[WARN] No key bundle for '{rest}'.")
+                else:
+                    # Compare over a channel that is not this one. Matching
+                    # numbers mean no one is sitting in the middle.
+                    number = generate_safety_number(
+                        self.x3dh_manager.signing_keypair.get_public_bytes(),
+                        bundle.signing_key,
+                        self.username,
+                        rest,
+                    )
+                    print(f"\nSafety number with {rest}:")
+                    print(f"  {number}")
+                    print(f"  Fingerprint: {generate_fingerprint(bundle.signing_key)}")
+                    print("Read this aloud to them. If it differs, stop talking.")
+
+        else:
+            print(f"\nUnknown command '/{command}'. Try /help")
+
+        return True
+
     def send_messages(self):
         """Handle user input and send messages."""
         print()
-        print("Type your messages below. Press Ctrl+C to quit.")
+        print("Type your messages below. /help for commands. Ctrl+C to quit.")
         print("=" * 60)
-        
+
         while self.running:
             try:
                 user_input = input(f"{self.username}> ")
-                
+
                 if not user_input.strip():
                     continue
-                
+
+                # Slash commands are local; they never reach the server as text
+                if user_input.lstrip().startswith('/'):
+                    self._handle_command(user_input.strip())
+                    continue
+
                 # Send encrypted message
                 if self.e2e_enabled:
                     self.send_encrypted_message(user_input.strip())
@@ -817,43 +930,110 @@ class ChatClient:
                 print(f"\n[ERROR] {e}", file=sys.stderr)
                 break
     
-    def start(self):
-        """Start the chat client."""
-        if not self.connect():
-            return False
-        
-        self.running = True
-        
+    def _interruptible_sleep(self, seconds: float):
+        """Sleep in slices so Ctrl+C and shutdown are not delayed by a long wait."""
+        waited = 0.0
+        while waited < seconds and self.running:
+            time.sleep(min(0.2, seconds - waited))
+            waited += 0.2
+
+    def _connect_with_backoff(self) -> bool:
+        """
+        Keep trying to connect until it works or the client is shutting down.
+
+        Returns:
+            True once connected, False if the client stopped first
+        """
+        delay = self.RECONNECT_BASE_DELAY
+        attempt = 0
+
+        while self.running:
+            if self.connect():
+                return True
+
+            attempt += 1
+            if not self.running:
+                break
+
+            # Jitter: without it every client of a restarted server retries in
+            # the same instant and knocks it over again.
+            wait = min(delay, self.RECONNECT_MAX_DELAY) * (0.5 + random.random())
+            print(f"[NET] Reconnecting in {wait:.1f}s (attempt {attempt})...")
+            self._interruptible_sleep(wait)
+            delay = min(delay * 2, self.RECONNECT_MAX_DELAY)
+
+        return False
+
+    def _run_session(self):
+        """Drive one connected session until the link drops."""
         # Receive welcome message
         try:
             data = self.socket.recv(config.BUFFER_SIZE)
             if data:
                 message = json.loads(data.decode('utf-8'))
                 print(f"\n{message.get('content', '')}\n")
-        except:
+        except Exception:
             pass
-        
-        # Generate X3DH keys
+
+        self.connected = True
+
+        # Publish the (restored) bundle. Same identity across reconnects, so
+        # peers see no key change; consumed one-time keys are not republished.
         if self.e2e_enabled:
             self.generate_keys()
-        # Start receiver thread
-        receiver_thread = threading.Thread(
-            target=self.receive_messages,
-            daemon=True
-        )
-        receiver_thread.start()
-        
+
+        # Blocks until the connection drops
+        self.receive_messages()
+        self.connected = False
+
+    def _network_loop(self):
+        """Supervisor: stay connected for as long as the client is running."""
+        first = True
+        while self.running:
+            if not self._connect_with_backoff():
+                break
+
+            if not first:
+                print("[NET] Reconnected. Sessions resume from saved state.")
+            first = False
+
+            self._run_session()
+
+            if self.running:
+                print("\n[NET] Connection lost. Reconnecting...")
+                sys.stdout.flush()
+
+        self.connected = False
+
+    def start(self):
+        """Start the chat client."""
+        self.running = True
+
+        network_thread = threading.Thread(target=self._network_loop, daemon=True)
+        network_thread.start()
+
+        # Wait for the first connection before handing the user a prompt
+        deadline = time.time() + 30
+        while self.running and not self.connected and time.time() < deadline:
+            time.sleep(0.1)
+
+        if not self.connected:
+            print("[ERROR] Could not establish a connection.", file=sys.stderr)
+            self.running = False
+            return False
+
         # Handle sending in main thread
         self.send_messages()
-        
+
         # Cleanup
         self.running = False
+        self.connected = False
         if self.socket:
             try:
                 self.socket.close()
-            except:
+            except Exception:
                 pass
-        
+
         print("Disconnected.")
         return True
     
