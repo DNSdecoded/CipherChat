@@ -12,6 +12,11 @@ ratchet_state_*.json
 server.log
 *.log
 
+# Server-side offline message queue
+cipherchat_server.db
+*.db-journal
+*.db-wal
+
 # Python
 __pycache__/
 *.py[cod]

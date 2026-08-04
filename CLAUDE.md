@@ -19,6 +19,8 @@ No test framework, no linter, no CI. Tests are `if __name__ == "__main__"` self-
 python x25519_utils.py     # DH agreement, KDFs, Ed25519 sign/verify, safety number
 python x3dh.py             # bundle gen + signature verification, initiate/respond
 python double_ratchet.py   # round trips, AEAD header binding, tamper rejection
+python ratchet_store.py    # encrypted persistence, wrong passphrase, tampering
+python message_store.py    # offline queue FIFO, TTL, depth cap, durability
 ```
 
 End-to-end protocol tests drive a real server and real clients over loopback TLS:
@@ -48,9 +50,10 @@ broadcasting while holding them would deadlock. Never hold `state_lock` across a
 `username` variable — a rejected join (duplicate name, bad version) sets that variable without ever
 registering, and tearing down on it evicts the legitimate holder of the name.
 
-Message types (`type` field): `join` (carries `x3dh_bundle` + `protocol_version`), `bundle_sync`
-(server sends all known peers' bundles to a joiner), `key_bundle` (broadcast of a new joiner's
-bundle), `bundle_removal` (peer left), `ratchet_message` (unicast, relayed by recipient username),
+Message types (`type` field): `join` (carries `x3dh_bundle`, `onetime_prekeys`, `protocol_version`),
+`bundle_sync` (server sends all known peers' bundles to a joiner), `key_bundle` (a new joiner's
+bundle, sent per-socket), `presence` (peer went offline — **not** a signal to discard anything),
+`ratchet_message` (unicast, relayed by recipient username), `opk_replenish` / `opk_upload`,
 `system`, `message` (plaintext fallback), `error`.
 
 `PROTOCOL_VERSION = "3.0"` is asserted on both `server.py` and `client_v2.py`. The server hard-rejects
@@ -127,7 +130,17 @@ A changed key prompts the user interactively; rejection drops that peer's bundle
   without SANs will fail verification outright. Operators must distribute `server.crt` to clients
   out-of-band. `wrap_socket` must pass a `server_hostname` matching the address actually dialled —
   the IPv4 fallback path dials `127.0.0.1`, not the original hostname.
-- Ratchet state is memory-only, so every client restart forces a fresh X3DH with every peer, and
-  messages to offline users are dropped rather than queued.
+- Client identity and ratchet sessions persist through `ratchet_store.py` (Scrypt + AES-GCM, keyed by
+  a passphrase). An **empty passphrase disables persistence entirely** rather than writing plaintext,
+  which restores the old memory-only behaviour. A store that exists but will not decrypt is fatal on
+  purpose: continuing with a fresh identity is what an attacker who deleted the file would want.
+- A user's bundle deliberately **outlives their connection**. Deleting it on disconnect (as pre-2.2
+  `bundle_removal` did) makes it impossible to encrypt anything for an offline user. Clients must
+  likewise keep the peer's bundle *and* ratchet on `presence: offline` — dropping the ratchet forces
+  a fresh X3DH, a security-reset event, every time a peer blinks offline.
+- Messages for offline-but-known users are queued in SQLite (`message_store.py`, 7-day TTL, 500 per
+  recipient) and flushed in `id` order at JOIN, before any live traffic. Bundles themselves are still
+  memory-only, so they survive a disconnect but not a server restart, after which clients republish
+  on their next JOIN.
 - Client resolves `localhost` to IPv6 first and falls back to IPv4 only for the literal string
   `localhost`; other hosts get no fallback.

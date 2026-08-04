@@ -674,17 +674,17 @@ class ChatClient:
             })
             print(f"\n[E2E] Uploaded {len(entries)} fresh one-time pre-key(s)")
 
-        elif msg_type == 'bundle_removal':
-            # User disconnected
+        elif msg_type == 'presence':
+            # A peer went offline. Deliberately keep their bundle AND their
+            # ratchet session: discarding either would make it impossible to
+            # message them while away, and would force a fresh X3DH — a
+            # security-reset event — every time they blink offline.
             username = message.get('username')
+            status = message.get('status', 'offline')
             if username:
-                with self.bundles_lock:
-                    if username in self.peer_bundles:
-                        del self.peer_bundles[username]
-                with self.ratchet_lock:
-                    if username in self.ratchet_states:
-                        del self.ratchet_states[username]
-                print(f"\n[E2E] Removed bundle for {username}")
+                print(f"\n[E2E] {username} is {status} (session retained)")
+                sys.stdout.flush()
+                print(f"{self.username}> ", end='', flush=True)
         
         elif msg_type == 'ratchet_message':
             # Encrypted message

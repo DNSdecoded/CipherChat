@@ -454,7 +454,72 @@ def main():
 
     check("identity and session survive a restart", test_persistence)
 
-    # --- 10. Buffer bound drops a flooding connection ---
+    # --- 10. Offline queue: held while away, delivered in order on return ---
+    def test_offline_queue():
+        recipient = RawClient('sleeper')
+        recipient.join()
+        recipient.absorb_bundles()
+
+        sender = RawClient('waker')
+        sender.join()
+        sender.absorb_bundles()
+        recipient.absorb_bundles()
+
+        # Recipient goes away. Their bundle must survive the disconnect, or the
+        # sender cannot encrypt to them at all.
+        recipient.close()
+        time.sleep(0.4)
+
+        sender.send_to('sleeper', "first while away")
+        sender.send_to('sleeper', "second while away")
+        sender.send_to('sleeper', "third while away")
+        time.sleep(0.4)
+        assert server.message_store.queue_depth('sleeper') == 3, \
+            f"expected 3 queued, got {server.message_store.queue_depth('sleeper')}"
+
+        # Reconnect with the SAME identity, as persistence would give us
+        returning = RawClient.__new__(RawClient)
+        returning.username = 'sleeper'
+        returning.port = TEST_PORT
+        returning.keys = recipient.keys          # same identity + one-time keys
+        returning.ratchets = {}
+        returning.peer_bundles = dict(recipient.peer_bundles)
+        returning.inbox = []
+        returning._buffer = ""
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.load_verify_locations(config.SERVER_CERT)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.check_hostname = True
+        raw = socket.create_connection(('127.0.0.1', TEST_PORT), timeout=TIMEOUT)
+        returning.sock = ctx.wrap_socket(raw, server_hostname='127.0.0.1')
+        returning.sock.settimeout(TIMEOUT)
+        returning.join()
+
+        delivered = []
+        for _ in range(3):
+            msg = returning.recv_until('ratchet_message')
+            if msg is None:
+                break
+            delivered.append(msg)
+
+        assert len(delivered) == 3, f"expected 3 delivered, got {len(delivered)}"
+        assert server.message_store.queue_depth('sleeper') == 0, "queue not drained"
+
+        # Order must be preserved, and all three must decrypt on one session
+        ratchet = returning.responder_ratchet(delivered[0]['header'], 'waker')
+        texts = [
+            ratchet.ratchet_decrypt(
+                base64.b64decode(m['ciphertext']), m['header']
+            ).decode()
+            for m in delivered
+        ]
+        assert texts == ["first while away", "second while away", "third while away"], texts
+
+        returning.close(); sender.close()
+
+    check("offline messages queued and delivered in order", test_offline_queue)
+
+    # --- 11. Buffer bound drops a flooding connection ---
     def test_buffer_bound():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(config.SERVER_CERT)

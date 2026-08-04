@@ -13,6 +13,7 @@ import select
 from datetime import datetime
 
 import config
+from message_store import MessageStore, DEFAULT_DB_PATH
 
 
 # Configure logging
@@ -42,7 +43,11 @@ class ChatServer:
     MAX_ONETIME_PREKEYS = 50
     ONETIME_PREKEY_LOW_WATER = 5
 
-    def __init__(self, port=config.SERVER_PORT, enable_ipv4=config.ENABLE_IPV4, enable_ipv6=config.ENABLE_IPV6):
+    # How often to sweep expired queued messages
+    PURGE_INTERVAL_SECONDS = 3600
+
+    def __init__(self, port=config.SERVER_PORT, enable_ipv4=config.ENABLE_IPV4,
+                 enable_ipv6=config.ENABLE_IPV6, db_path=None):
         self.port = port
         self.enable_ipv4 = enable_ipv4
         self.enable_ipv6 = enable_ipv6
@@ -60,6 +65,13 @@ class ChatServer:
         # two locks would have to nest — and broadcast-under-lock would deadlock.
         # Never hold this across a socket send; snapshot, release, then send.
         self.state_lock = threading.Lock()
+
+        # Durable queue for users who are offline when a message is sent.
+        # NOTE: bundles themselves live in memory only. They survive a client
+        # disconnect but not a server restart, after which clients republish on
+        # their next JOIN.
+        self.message_store = MessageStore(path=db_path or DEFAULT_DB_PATH)
+        self._purge_timer = None
         
     def create_ssl_context(self):
         """Create and configure SSL context for secure connections."""
@@ -130,7 +142,14 @@ class ChatServer:
             logger.error("Failed to bind to any address. Exiting.")
             sys.exit(1)
         
+        # Drop anything that expired while the server was down, then sweep hourly
+        expired = self.message_store.purge_expired()
+        if expired:
+            logger.info(f"Purged {expired} expired queued message(s) at startup")
+        self._schedule_purge()
+
         logger.info(f"Maximum clients: {config.MAX_CLIENTS}")
+        logger.info(f"Queued messages pending: {self.message_store.queue_depth()}")
         logger.info(f"TLS encryption: ENABLED (TLS 1.2+)")
         logger.info("=" * 60)
         logger.info("Waiting for client connections...")
@@ -336,6 +355,20 @@ class ChatServer:
                                     'timestamp': datetime.now().isoformat()
                                 }
                                 self.send_message(client_socket, confirm_msg)
+
+                                # Deliver anything queued while they were away,
+                                # in send order, BEFORE any live traffic can
+                                # arrive and get ahead of it.
+                                pending = self.message_store.drain(username)
+                                if pending:
+                                    self.send_message(client_socket, {
+                                        'type': 'system',
+                                        'content': f'Delivering {len(pending)} message(s) received while you were offline.',
+                                        'timestamp': datetime.now().isoformat()
+                                    })
+                                    for queued in pending:
+                                        self.send_message(client_socket, queued)
+                                    logger.info(f"Delivered {len(pending)} queued message(s) to {username}")
                         
                         # Handle RATCHET_MESSAGE (relay to recipient)
                         elif msg_type == 'ratchet_message':
@@ -348,19 +381,39 @@ class ChatServer:
                                 # this keeps the envelope consistent with it.
                                 message['sender'] = username
 
-                                # Find recipient socket
+                                # Find recipient socket, and whether we know them
+                                # at all, in one critical section
                                 recipient_socket = None
                                 with self.state_lock:
                                     for sock, user in self.clients.items():
                                         if user == recipient:
                                             recipient_socket = sock
                                             break
+                                    recipient_known = recipient in self.client_bundles
                                 
                                 if recipient_socket:
                                     self.send_message(recipient_socket, message)
                                     logger.debug(f"Relayed ratchet message: {username} -> {recipient}")
+                                elif recipient_known:
+                                    # Offline but registered: hold it. The payload
+                                    # is already sealed, so queuing gives the
+                                    # server nothing it did not have in transit.
+                                    if self.message_store.enqueue(recipient, username, message):
+                                        logger.info(f"Queued message {username} -> {recipient} (offline)")
+                                    else:
+                                        logger.warning(f"Queue full for {recipient}; dropped message from {username}")
+                                        self.send_message(client_socket, {
+                                            'type': 'error',
+                                            'content': f"{recipient}'s offline queue is full; message not delivered.",
+                                            'timestamp': datetime.now().isoformat()
+                                        })
                                 else:
-                                    logger.warning(f"Recipient {recipient} not online for message from {username}")
+                                    logger.warning(f"Unknown recipient {recipient} from {username}")
+                                    self.send_message(client_socket, {
+                                        'type': 'error',
+                                        'content': f"Unknown recipient '{recipient}'.",
+                                        'timestamp': datetime.now().isoformat()
+                                    })
                             
                         # Handle OPK_UPLOAD (client topping up its one-time keys)
                         elif msg_type == 'opk_upload':
@@ -417,19 +470,17 @@ class ChatServer:
             # that variable without ever registering, and tearing down on it
             # would evict the legitimate holder of the name.
             departed = None
-            bundle_removed = False
             with self.state_lock:
                 if client_socket in self.clients:
                     departed = self.clients.pop(client_socket)
-                    if config.E2E_ENABLED and departed in self.client_bundles:
-                        del self.client_bundles[departed]
-                        bundle_removed = True
+
+            # The bundle deliberately OUTLIVES the connection. Deleting it here
+            # would make it impossible to encrypt anything for an offline user,
+            # which would defeat the offline queue entirely.
 
             if departed:
                 username = departed
-                logger.info(f"User '{username}' disconnected")
-                if bundle_removed:
-                    logger.info(f"[E2E] Removed X3DH bundle for {username}")
+                logger.info(f"User '{username}' disconnected (bundle retained)")
 
                 # Notify other clients that user left
                 leave_msg = {
@@ -438,16 +489,16 @@ class ChatServer:
                     'timestamp': datetime.now().isoformat()
                 }
                 self.broadcast(leave_msg)
-                
-                # Notify other clients to remove this user's bundle
-                if bundle_removed:
-                    bundle_removal_msg = {
-                        'type': 'bundle_removal',
-                        'username': username,
-                        'timestamp': datetime.now().isoformat()
-                    }
-                    self.broadcast(bundle_removal_msg)
-                    logger.info(f"[E2E] Broadcast bundle_removal for {username}")
+
+                # Presence only. This replaces the old bundle_removal: peers must
+                # KEEP the bundle and the ratchet session so they can still
+                # encrypt to this user, whose messages we now queue.
+                self.broadcast({
+                    'type': 'presence',
+                    'username': username,
+                    'status': 'offline',
+                    'timestamp': datetime.now().isoformat()
+                })
             
             try:
                 client_socket.close()
@@ -475,6 +526,25 @@ class ChatServer:
         # Dead connections are reaped by handle_client's finally block, which also
         # drops the user's X3DH bundle and notifies the remaining peers.
     
+    def _schedule_purge(self):
+        """Sweep expired queued messages on a repeating timer."""
+        if not self.running and self._purge_timer is not None:
+            return
+
+        def sweep():
+            try:
+                removed = self.message_store.purge_expired()
+                if removed:
+                    logger.info(f"Purged {removed} expired queued message(s)")
+            except Exception as e:
+                logger.error(f"Purge failed: {e}")
+            if self.running:
+                self._schedule_purge()
+
+        self._purge_timer = threading.Timer(self.PURGE_INTERVAL_SECONDS, sweep)
+        self._purge_timer.daemon = True
+        self._purge_timer.start()
+
     def _serve_bundle_locked(self, owner: str):
         """
         Build the bundle to hand to one requester, consuming a one-time pre-key.
@@ -536,6 +606,10 @@ class ChatServer:
         """Stop the server and cleanup resources."""
         logger.info("Stopping server...")
         self.running = False
+
+        if self._purge_timer is not None:
+            self._purge_timer.cancel()
+            self._purge_timer = None
         
         # Close all client connections
         with self.state_lock:
@@ -559,6 +633,11 @@ class ChatServer:
             except:
                 pass
         
+        try:
+            self.message_store.close()
+        except Exception:
+            pass
+
         logger.info("Server stopped")
 
 
