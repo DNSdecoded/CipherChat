@@ -37,6 +37,11 @@ class ChatServer:
     # Without this a client that never sends a newline grows the buffer forever.
     MAX_BUFFER_SIZE = 64 * 1024
 
+    # One-time pre-key pool held per user. Capped so a client cannot use the
+    # server as unbounded storage; refilled when it drops below the low water mark.
+    MAX_ONETIME_PREKEYS = 50
+    ONETIME_PREKEY_LOW_WATER = 5
+
     def __init__(self, port=config.SERVER_PORT, enable_ipv4=config.ENABLE_IPV4, enable_ipv6=config.ENABLE_IPV6):
         self.port = port
         self.enable_ipv4 = enable_ipv4
@@ -47,7 +52,8 @@ class ChatServer:
         self.server_socket_ipv6 = None
 
         # Forward Secrecy: X3DH bundle registry
-        self.client_bundles = {}  # {username: bundle_dict}
+        # {username: {'bundle': dict, 'opks': [{'id': int, 'key': hex}, ...]}}
+        self.client_bundles = {}
 
         # One lock guards both `clients` and `client_bundles`. They are updated
         # together on join and leave, and broadcast() needs the client list, so
@@ -250,13 +256,20 @@ class ChatServer:
                                         duplicate = False
                                         self.clients[client_socket] = username
                                         if bundle_dict and config.E2E_ENABLED:
-                                            self.client_bundles[username] = bundle_dict
-                                        if config.E2E_ENABLED:
-                                            existing_bundles = {
-                                                uname: bundle
-                                                for uname, bundle in self.client_bundles.items()
-                                                if uname != username
+                                            self.client_bundles[username] = {
+                                                'bundle': bundle_dict,
+                                                'opks': list(message.get('onetime_prekeys') or [])[:self.MAX_ONETIME_PREKEYS],
                                             }
+                                        if config.E2E_ENABLED:
+                                            # Each peer contributes a DISTINCT one-time
+                                            # key; serving the same one twice would
+                                            # destroy the one-time guarantee.
+                                            for uname in self.client_bundles:
+                                                if uname == username:
+                                                    continue
+                                                served = self._serve_bundle_locked(uname)
+                                                if served:
+                                                    existing_bundles[uname] = served
 
                                 # A duplicate name would overwrite the original's
                                 # bundle and silently capture traffic meant for them.
@@ -284,17 +297,30 @@ class ChatServer:
                                     self.send_message(client_socket, bundle_sync_msg)
                                     logger.info(f"[E2E] Sent bundle_sync with {len(existing_bundles)} bundle(s) to {username}")
                                 
-                                # Broadcast the new user's bundle to all existing clients
+                                # Announce the new user's bundle to existing clients.
+                                # NOT a broadcast: every recipient must get its own
+                                # one-time key, so each payload differs.
                                 if bundle_dict and config.E2E_ENABLED:
-                                    bundle_broadcast = {
-                                        'type': 'key_bundle',
-                                        'username': username,
-                                        'bundle': bundle_dict,
-                                        'timestamp': datetime.now().isoformat()
-                                    }
-                                    self.broadcast(bundle_broadcast, exclude=client_socket)
-                                    logger.info(f"[E2E] Broadcast key_bundle for {username}")
-                                
+                                    with self.state_lock:
+                                        payloads = [
+                                            (sock, self._serve_bundle_locked(username))
+                                            for sock in self.clients
+                                            if sock != client_socket
+                                        ]
+
+                                    for sock, served in payloads:
+                                        if served:
+                                            self.send_message(sock, {
+                                                'type': 'key_bundle',
+                                                'username': username,
+                                                'bundle': served,
+                                                'timestamp': datetime.now().isoformat()
+                                            })
+                                    logger.info(f"[E2E] Sent key_bundle for {username} to {len(payloads)} peer(s)")
+
+                                # Ask anyone running low to top up their pool
+                                self._request_replenishments()
+
                                 # Notify all clients about the new user
                                 join_notification = {
                                     'type': 'system',
@@ -336,6 +362,22 @@ class ChatServer:
                                 else:
                                     logger.warning(f"Recipient {recipient} not online for message from {username}")
                             
+                        # Handle OPK_UPLOAD (client topping up its one-time keys)
+                        elif msg_type == 'opk_upload':
+                            if username and config.E2E_ENABLED:
+                                new_keys = message.get('onetime_prekeys') or []
+                                with self.state_lock:
+                                    entry = self.client_bundles.get(username)
+                                    if entry is not None:
+                                        entry['opks'].extend(new_keys)
+                                        # Bound the pool so a client cannot use it
+                                        # as unbounded server-side storage
+                                        del entry['opks'][self.MAX_ONETIME_PREKEYS:]
+                                        held = len(entry['opks'])
+                                    else:
+                                        held = 0
+                                logger.info(f"[E2E] {username} uploaded {len(new_keys)} one-time key(s), pool={held}")
+
                         # Handle ENCRYPTED_MESSAGE (legacy, for compatibility)
                         elif msg_type == 'encrypted_message':
                             if username:  # Only process if user has joined
@@ -433,6 +475,58 @@ class ChatServer:
         # Dead connections are reaped by handle_client's finally block, which also
         # drops the user's X3DH bundle and notifies the remaining peers.
     
+    def _serve_bundle_locked(self, owner: str):
+        """
+        Build the bundle to hand to one requester, consuming a one-time pre-key.
+
+        Caller MUST hold state_lock — the pop and the read must be atomic, or two
+        initiators could receive the same one-time key.
+
+        Running out is not an error: X3DH falls back to a 3-DH handshake, which
+        costs the first message its extra forward secrecy but still works.
+
+        Args:
+            owner: User whose bundle is being requested
+
+        Returns:
+            Bundle dict with onetime_prekey/onetime_prekey_id filled in, or None
+        """
+        entry = self.client_bundles.get(owner)
+        if not entry:
+            return None
+
+        served = dict(entry['bundle'])
+        if entry['opks']:
+            opk = entry['opks'].pop(0)
+            served['onetime_prekey'] = opk.get('key')
+            served['onetime_prekey_id'] = opk.get('id')
+        else:
+            served['onetime_prekey'] = None
+            served['onetime_prekey_id'] = None
+        return served
+
+    def _request_replenishments(self):
+        """Ask users whose one-time pool is running low to upload more."""
+        if not config.E2E_ENABLED:
+            return
+
+        with self.state_lock:
+            low = {
+                name for name, entry in self.client_bundles.items()
+                if len(entry['opks']) < self.ONETIME_PREKEY_LOW_WATER
+            }
+            targets = [
+                (sock, name) for sock, name in self.clients.items() if name in low
+            ]
+
+        for sock, name in targets:
+            self.send_message(sock, {
+                'type': 'opk_replenish',
+                'count': self.MAX_ONETIME_PREKEYS,
+                'timestamp': datetime.now().isoformat()
+            })
+            logger.info(f"[E2E] Requested one-time key replenishment from {name}")
+
     def get_all_usernames(self) -> list:
         """Get list of all connected usernames."""
         with self.state_lock:

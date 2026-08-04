@@ -70,6 +70,10 @@ class RawClient:
             'type': 'join',
             'username': self.username,
             'x3dh_bundle': self.keys.get_prekey_bundle().to_dict(),
+            'onetime_prekeys': [
+                {'id': i, 'key': p.get_public_bytes().hex()}
+                for i, p in self.keys.onetime_prekeys.items()
+            ],
             'protocol_version': protocol_version or ChatServer.PROTOCOL_VERSION,
         })
 
@@ -119,6 +123,7 @@ class RawClient:
         secret, ephemeral = x3dh_initiate(self.keys.identity_keypair, bundle)
         ratchet = DoubleRatchet(RatchetState.initialize_alice(secret, bundle.signed_prekey))
         ratchet.x3dh_ephemeral_pub = ephemeral
+        ratchet.x3dh_onetime_id = bundle.onetime_prekey_id
         self.ratchets[peer] = ratchet
         return ratchet
 
@@ -128,6 +133,8 @@ class RawClient:
         first = hasattr(ratchet, 'x3dh_ephemeral_pub')
         if first:
             extra['x3dh_ephemeral'] = ratchet.x3dh_ephemeral_pub.hex()
+            if getattr(ratchet, 'x3dh_onetime_id', None) is not None:
+                extra['onetime_prekey_id'] = ratchet.x3dh_onetime_id
         ciphertext, header = ratchet.ratchet_encrypt(text.encode(), extra_header=extra)
         if first:
             delattr(ratchet, 'x3dh_ephemeral_pub')
@@ -135,10 +142,13 @@ class RawClient:
 
     def responder_ratchet(self, header, peer):
         """Derive the responder-side ratchet for a first message."""
+        opk = self.keys.consume_onetime_prekey(header.get('onetime_prekey_id'))
+        if header.get('onetime_prekey_id') is not None and opk is None:
+            raise AssertionError("one-time key unavailable or already consumed")
         shared = x3dh_respond(
             self.keys.identity_keypair,
             self.keys.signed_prekey_pair,
-            None,
+            opk,
             self.peer_bundles[peer].identity_key,
             bytes.fromhex(header['x3dh_ephemeral']),
         )
@@ -314,7 +324,78 @@ def main():
 
     check("outdated protocol version rejected", test_version_gate)
 
-    # --- 7. Buffer bound drops a flooding connection ---
+    # --- 7. One-time pre-keys: served, distinct per requester, consumed once ---
+    def test_onetime_prekeys():
+        owner = RawClient('opk_owner')
+        owner.join()
+        owner.absorb_bundles()
+
+        # Two separate initiators must receive DIFFERENT one-time keys
+        one = RawClient('taker_one')
+        one.join(); one.absorb_bundles()
+        two = RawClient('taker_two')
+        two.join(); two.absorb_bundles()
+
+        # Owner joined first, so it must pick up the newcomers' announcements
+        owner.absorb_bundles()
+
+        b1 = one.peer_bundles['opk_owner']
+        b2 = two.peer_bundles['opk_owner']
+        assert b1.onetime_prekey is not None, "no one-time key was served"
+        assert b1.onetime_prekey_id != b2.onetime_prekey_id, \
+            "two initiators were served the same one-time key"
+        assert b1.onetime_prekey != b2.onetime_prekey
+
+        # A 4-DH handshake must actually work end to end
+        one.send_to('opk_owner', "four dh please")
+        got = owner.recv_until('ratchet_message')
+        assert got is not None, "owner received nothing"
+        assert got['header'].get('onetime_prekey_id') == b1.onetime_prekey_id
+        ratchet = owner.responder_ratchet(got['header'], 'taker_one')
+        assert ratchet.ratchet_decrypt(
+            base64.b64decode(got['ciphertext']), got['header']
+        ) == b"four dh please"
+
+        # That key is now destroyed: reusing the id must fail
+        assert owner.keys.consume_onetime_prekey(b1.onetime_prekey_id) is None, \
+            "one-time key survived its single use"
+
+        owner.close(); one.close(); two.close()
+
+    check("one-time pre-keys distinct per requester and consumed once", test_onetime_prekeys)
+
+    # --- 8. Pool depletion falls back to 3-DH rather than failing ---
+    def test_onetime_depletion():
+        owner = RawClient('drained')
+        # Publish a pool of exactly one key
+        owner.keys.onetime_prekeys = dict(list(owner.keys.onetime_prekeys.items())[:1])
+        owner.join()
+        owner.absorb_bundles()
+
+        first = RawClient('drain_a'); first.join(); first.absorb_bundles()
+        second = RawClient('drain_b'); second.join(); second.absorb_bundles()
+        owner.absorb_bundles()
+
+        b1 = first.peer_bundles['drained']
+        b2 = second.peer_bundles['drained']
+        assert b1.onetime_prekey is not None, "first requester should get the only key"
+        assert b2.onetime_prekey is None, "pool should be empty for the second requester"
+        assert b2.onetime_prekey_id is None
+
+        # 3-DH fallback must still produce a working session
+        second.send_to('drained', "three dh fallback")
+        got = owner.recv_until('ratchet_message')
+        assert got is not None
+        ratchet = owner.responder_ratchet(got['header'], 'drain_b')
+        assert ratchet.ratchet_decrypt(
+            base64.b64decode(got['ciphertext']), got['header']
+        ) == b"three dh fallback"
+
+        owner.close(); first.close(); second.close()
+
+    check("pool depletion falls back to 3-DH", test_onetime_depletion)
+
+    # --- 9. Buffer bound drops a flooding connection ---
     def test_buffer_bound():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(config.SERVER_CERT)

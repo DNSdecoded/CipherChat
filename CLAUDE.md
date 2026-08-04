@@ -79,10 +79,11 @@ Crypto layering, bottom up:
 - `client_v2.py` — session glue: per-peer `ratchet_states` and `peer_bundles` (each behind its own lock,
   `ratchet_lock` / `bundles_lock`), TOFU trust store, send/receive threads.
 
-Session flow: client generates a bundle and sends it with JOIN → server stores and cross-broadcasts
-bundles → first send to a peer calls `_initialize_ratchet_with_peer` (Alice role) and attaches
-`x3dh_ephemeral` to the first header → the receiver sees an unknown sender, reads that field, and calls
-`_initialize_ratchet_as_responder` (Bob role). Bob's ratchet is seeded from his *signed prekey pair*, so
+Session flow: client generates a bundle plus a one-time key pool and sends both with JOIN → server
+stores them and cross-announces bundles, attaching a distinct one-time key per recipient → first send
+to a peer calls `_initialize_ratchet_with_peer` (Alice role), which puts `x3dh_ephemeral` and
+`onetime_prekey_id` in the first header → the receiver sees an unknown sender, reads those fields, and
+calls `_initialize_ratchet_as_responder` (Bob role), which consumes that exact one-time key. Bob's ratchet is seeded from his *signed prekey pair*, so
 Alice's `RatchetState.initialize_alice` must be given `bundle.signed_prekey` as the peer DH key — these
 two must stay in agreement or the first decrypt fails.
 
@@ -108,9 +109,14 @@ A changed key prompts the user interactively; rejection drops that peer's bundle
   existed, so they are still tracked and ignore rules do not apply to them. Untrack with
   `git rm -r --cached certs __pycache__`. Treat the committed key as compromised — regenerate with
   `generate_certs.py` and never reuse it.
-- One-time prekeys are still disabled in `X3DHKeyManager` — X3DH runs DH1..DH3 only. The original
-  reason (no MITM protection) is gone now that bundles are really signed, so re-enabling them is
-  tracked work, not a permanent design choice.
+- One-time pre-keys are live. The client publishes a pool with JOIN; the **server** owns handout and
+  attaches a distinct key per requester (`_serve_bundle_locked`, which must be called under
+  `state_lock` — a racy pop would serve the same key twice). Depletion is not an error: X3DH falls
+  back to 3-DH. The server asks for a top-up via `opk_replenish` below `ONETIME_PREKEY_LOW_WATER`,
+  answered with `opk_upload`, and caps the pool at `MAX_ONETIME_PREKEYS`. Because each recipient needs
+  a different key, `key_bundle` announcements are sent per-socket rather than through `broadcast()`.
+  OPKs are deliberately not covered by the pre-key signature (as in Signal): substituting one is a
+  denial of service, not a compromise, since DH1..DH3 still involve keys the attacker cannot compute.
 - A replayed **first** message (the one carrying `x3dh_ephemeral`) still establishes a session at a
   client that holds no ratchet for that sender. AEAD binding prevents modification, not replay;
   closing this needs a seen-ephemeral cache. Known open gap.

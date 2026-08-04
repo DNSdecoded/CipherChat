@@ -51,8 +51,13 @@ class X3DHPreKeyBundle:
     signed_prekey: bytes  # 32-byte X25519 public key
     signed_prekey_signature: bytes  # Ed25519 sig over identity_key||signed_prekey
 
-    # One-time pre-keys (ephemeral, used once and deleted)
+    # One-time pre-keys (ephemeral, used once and deleted).
+    # Deliberately NOT covered by signed_prekey_signature, matching Signal: a
+    # substituted one-time key only breaks the session, because DH1..DH3 still
+    # involve keys the attacker cannot compute. Substitution is denial of
+    # service, not compromise.
     onetime_prekey: Optional[bytes] = None  # 32-byte X25519 public key
+    onetime_prekey_id: Optional[int] = None  # which key the owner must consume
 
     def to_dict(self) -> dict:
         """Serialize bundle for transmission"""
@@ -61,7 +66,8 @@ class X3DHPreKeyBundle:
             'signing_key': self.signing_key.hex(),
             'signed_prekey': self.signed_prekey.hex(),
             'signed_prekey_signature': self.signed_prekey_signature.hex(),
-            'onetime_prekey': self.onetime_prekey.hex() if self.onetime_prekey else None
+            'onetime_prekey': self.onetime_prekey.hex() if self.onetime_prekey else None,
+            'onetime_prekey_id': self.onetime_prekey_id
         }
 
     @classmethod
@@ -78,7 +84,8 @@ class X3DHPreKeyBundle:
             signing_key=bytes.fromhex(data['signing_key']),
             signed_prekey=bytes.fromhex(data['signed_prekey']),
             signed_prekey_signature=bytes.fromhex(data['signed_prekey_signature']),
-            onetime_prekey=bytes.fromhex(data['onetime_prekey']) if data.get('onetime_prekey') else None
+            onetime_prekey=bytes.fromhex(data['onetime_prekey']) if data.get('onetime_prekey') else None,
+            onetime_prekey_id=data.get('onetime_prekey_id')
         )
 
 
@@ -100,22 +107,60 @@ class X3DHKeyManager:
         # Medium-term signed pre-key (rotated periodically)
         self.signed_prekey_pair = X25519KeyPair()
         
-        # One-time pre-keys (generated in batches)
-        # Disabled until MITM protection is implemented
-        self.onetime_prekey_pairs = []
-        
-        # Generate initial batch of one-time keys (disabled)
-        # self.generate_onetime_prekeys(10)
-    
-    def generate_onetime_prekeys(self, count: int = 10):
+        # One-time pre-keys, by id. Each is handed to exactly one initiator by
+        # the server and destroyed on first use, which is what gives the very
+        # first message forward secrecy before any ratchet step has happened.
+        self.onetime_prekeys = {}  # {id: X25519KeyPair}
+        self._next_onetime_id = 0
+
+        # Generate initial batch
+        self.generate_onetime_prekeys(self.DEFAULT_ONETIME_COUNT)
+
+    DEFAULT_ONETIME_COUNT = 10
+
+    def generate_onetime_prekeys(self, count: int = 10) -> list:
         """
         Generate a batch of one-time pre-keys.
-        
+
         Args:
             count: Number of one-time keys to generate
+
+        Returns:
+            Public entries to upload: [{'id': int, 'key': hex_str}, ...]
         """
+        entries = []
         for _ in range(count):
-            self.onetime_prekey_pairs.append(X25519KeyPair())
+            key_id = self._next_onetime_id
+            self._next_onetime_id += 1
+
+            keypair = X25519KeyPair()
+            self.onetime_prekeys[key_id] = keypair
+            entries.append({'id': key_id, 'key': keypair.get_public_bytes().hex()})
+
+        return entries
+
+    def consume_onetime_prekey(self, key_id) -> Optional[X25519KeyPair]:
+        """
+        Take a one-time pre-key out of the store, permanently.
+
+        Returns None for an unknown or already-used id, which is the expected
+        outcome for a replayed first message — the caller must treat that as a
+        failure rather than silently falling back to a 3-DH handshake, or the
+        one-time guarantee is lost.
+
+        Args:
+            key_id: Identifier the initiator echoed back
+
+        Returns:
+            The key pair, or None if it is not available
+        """
+        if key_id is None:
+            return None
+        return self.onetime_prekeys.pop(key_id, None)
+
+    def onetime_prekey_count(self) -> int:
+        """Number of unused one-time pre-keys still held."""
+        return len(self.onetime_prekeys)
     
     def get_prekey_bundle(self) -> X3DHPreKeyBundle:
         """
@@ -124,9 +169,9 @@ class X3DHKeyManager:
         Returns:
             X3DHPreKeyBundle with public keys
         """
-        # NOTE: One-time prekeys are DISABLED until MITM protection is implemented
-        # OPKs without identity verification create a false sense of security
-        # and are vulnerable to server-side key substitution attacks.
+        # The bundle itself carries no one-time key. The server holds the pool
+        # and attaches a distinct one per requester, so that two initiators
+        # never receive the same one-time key.
         onetime_key = None
 
         identity_public = self.identity_keypair.get_public_bytes()
@@ -139,7 +184,7 @@ class X3DHKeyManager:
             signed_prekey_signature=self.signing_keypair.sign(
                 prekey_signing_payload(identity_public, signed_prekey_public)
             ),
-            onetime_prekey=onetime_key  # Always None until MITM protection
+            onetime_prekey=onetime_key  # server attaches one per requester
         )
 
 
@@ -273,11 +318,23 @@ if __name__ == "__main__":
     print("\n[1] Bob generates key bundle...")
     bob_key_manager = X3DHKeyManager()
     
-    # Save the one-time key BEFORE getting the bundle
-    saved_onetime_keypair = None
-    # OPKs disabled, so this will be None
-    
+    # The server would hand out one of Bob's one-time keys; simulate that here
+    assert bob_key_manager.onetime_prekey_count() == X3DHKeyManager.DEFAULT_ONETIME_COUNT
+    served_id = next(iter(bob_key_manager.onetime_prekeys))
+    served_public = bob_key_manager.onetime_prekeys[served_id].get_public_bytes()
+
     bob_bundle = bob_key_manager.get_prekey_bundle()
+    bob_bundle.onetime_prekey = served_public
+    bob_bundle.onetime_prekey_id = served_id
+
+    # Bob consumes it when the first message arrives
+    saved_onetime_keypair = bob_key_manager.consume_onetime_prekey(served_id)
+    assert saved_onetime_keypair is not None, "one-time key was not available"
+
+    # Consuming the same id twice must fail — that is what makes it one-time
+    assert bob_key_manager.consume_onetime_prekey(served_id) is None
+    assert bob_key_manager.consume_onetime_prekey(9999) is None
+    assert bob_key_manager.onetime_prekey_count() == X3DHKeyManager.DEFAULT_ONETIME_COUNT - 1
     
     print(f"[OK] Bob's identity key: {bob_bundle.identity_key.hex()[:32]}...")
     print(f"[OK] Bob's signing key: {bob_bundle.signing_key.hex()[:32]}...")

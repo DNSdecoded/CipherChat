@@ -210,11 +210,20 @@ class ChatClient:
         print(f"[E2E] Protocol: Signal (X3DH + Double Ratchet)")
         print(f"[E2E] Sending X3DH bundle with JOIN")
         
+        # Publish the one-time key pool alongside the bundle. The server hands
+        # out one per requester so no two initiators share a key.
+        onetime_prekeys = [
+            {'id': key_id, 'key': pair.get_public_bytes().hex()}
+            for key_id, pair in self.x3dh_manager.onetime_prekeys.items()
+        ]
+        print(f"[E2E] Publishing {len(onetime_prekeys)} one-time pre-key(s)")
+
         # Send JOIN with X3DH bundle
         join_msg = {
             'type': 'join',
             'username': self.username,
             'x3dh_bundle': bundle.to_dict(),
+            'onetime_prekeys': onetime_prekeys,
             'protocol_version': self.PROTOCOL_VERSION
         }
         self.send_message(join_msg)
@@ -396,6 +405,8 @@ class ChatClient:
                 is_first_message = hasattr(ratchet, 'x3dh_ephemeral_pub')
                 if is_first_message:
                     extra_header['x3dh_ephemeral'] = ratchet.x3dh_ephemeral_pub.hex()
+                    if getattr(ratchet, 'x3dh_onetime_id', None) is not None:
+                        extra_header['onetime_prekey_id'] = ratchet.x3dh_onetime_id
 
                 # Encrypt with ratchet
                 ciphertext, header = ratchet.ratchet_encrypt(
@@ -442,27 +453,47 @@ class ChatClient:
         # Store X3DH ephemeral key for first message
         # This is needed so the responder can derive the same shared secret
         ratchet.x3dh_ephemeral_pub = ephemeral_pub
-        
+
+        # Tell the responder which one-time key we consumed, so it can pick the
+        # matching private key. Without this it cannot reproduce DH4.
+        ratchet.x3dh_onetime_id = bundle.onetime_prekey_id
+
         self.ratchet_states[peer_username] = ratchet
-        
-        print(f"[E2E] Initialized ratchet with {peer_username} (initiator)")
+
+        used_opk = "with" if bundle.onetime_prekey else "without"
+        print(f"[E2E] Initialized ratchet with {peer_username} (initiator, {used_opk} one-time key)")
     
-    def _initialize_ratchet_as_responder(self, sender: str, alice_ephemeral_pub: bytes):
+    def _initialize_ratchet_as_responder(self, sender: str, alice_ephemeral_pub: bytes,
+                                         onetime_prekey_id=None):
         """
         Initialize Double Ratchet when receiving first message (Bob's role).
+
+        Args:
+            sender: Peer who initiated
+            alice_ephemeral_pub: Initiator's ephemeral public key
+            onetime_prekey_id: One-time key the initiator says it used, if any
         """
         # Get bundle with lock
         with self.bundles_lock:
             sender_bundle = self.peer_bundles.get(sender)
-        
+
         if not sender_bundle:
             raise Exception(f"No bundle for {sender}")
-        
+
+        # Consume the one-time key the initiator claims to have used. It is
+        # destroyed here: a second message naming the same id gets None and
+        # therefore derives a different secret and fails to decrypt.
+        onetime_keypair = self.x3dh_manager.consume_onetime_prekey(onetime_prekey_id)
+        if onetime_prekey_id is not None and onetime_keypair is None:
+            raise Exception(
+                f"One-time pre-key {onetime_prekey_id} is unknown or already used"
+            )
+
         # Perform X3DH as responder
         shared_secret = x3dh_respond(
             self.x3dh_manager.identity_keypair,
             self.x3dh_manager.signed_prekey_pair,
-            None,  # One-time key tracking not implemented yet
+            onetime_keypair,
             sender_bundle.identity_key,
             alice_ephemeral_pub
         )
@@ -560,6 +591,16 @@ class ChatClient:
                     self.keys_initialized = True
                 print(f"[E2E] Received bundle for {username}")
         
+        elif msg_type == 'opk_replenish':
+            # Server's pool for us is running low; generate and upload more.
+            target = message.get('count') or X3DHKeyManager.DEFAULT_ONETIME_COUNT
+            entries = self.x3dh_manager.generate_onetime_prekeys(target)
+            self.send_message({
+                'type': 'opk_upload',
+                'onetime_prekeys': entries,
+            })
+            print(f"\n[E2E] Uploaded {len(entries)} fresh one-time pre-key(s)")
+
         elif msg_type == 'bundle_removal':
             # User disconnected
             username = message.get('username')
@@ -623,8 +664,10 @@ class ChatClient:
                     else:
                         # Fallback to ratchet DH key (shouldn't happen in normal flow)
                         alice_ephemeral = bytes.fromhex(header['dh_public'])
-                    
-                    self._initialize_ratchet_as_responder(sender, alice_ephemeral)
+
+                    self._initialize_ratchet_as_responder(
+                        sender, alice_ephemeral, header.get('onetime_prekey_id')
+                    )
                 
                 ratchet = self.ratchet_states[sender]
             
